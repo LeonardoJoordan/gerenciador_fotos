@@ -1,0 +1,2 @@
+# Dependência necessária para executar a interface e processar as imagens.
+PySide6==6.11.1

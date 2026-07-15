@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Gerenciador Semântico de Fotos
+Comment=Organize e consulte fotos de militares e funcionários
+Exec=gerenciador-fotos
+Icon=com.leobelisario.GerenciadorFotos
+Terminal=false
+Type=Application
+Categories=Graphics;Photography;
+StartupNotify=true

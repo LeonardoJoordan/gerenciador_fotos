@@ -1,0 +1,63 @@
+id: com.leobelisario.GerenciadorFotos
+runtime: org.gnome.Platform
+runtime-version: '47'
+sdk: org.gnome.Sdk
+command: gerenciador-fotos
+
+build-options:
+  build-args:
+    - --share=network
+
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  # O aplicativo organiza, gira, exporta e exclui fotos escolhidas pelo usuário.
+  - --filesystem=home
+  - --filesystem=/media
+  - --filesystem=/mnt
+  - --filesystem=/run/media
+
+modules:
+  - name: python-dependencies
+    buildsystem: simple
+    build-commands:
+      - pip3 install --prefix=/app --no-cache-dir PySide6==6.11.1
+
+  - name: gerenciador-fotos
+    buildsystem: simple
+    build-commands:
+      - install -d /app/share/gerenciador-fotos/core
+      - install -d /app/share/gerenciador-fotos/ui/widgets
+      - install -Dm644 main.py /app/share/gerenciador-fotos/main.py
+      - cp -a core/. /app/share/gerenciador-fotos/core/
+      - cp -a ui/. /app/share/gerenciador-fotos/ui/
+      - install -Dm755 gerenciador-fotos /app/bin/gerenciador-fotos
+      - install -Dm644 com.leobelisario.GerenciadorFotos.desktop /app/share/applications/com.leobelisario.GerenciadorFotos.desktop
+      - install -Dm644 com.leobelisario.GerenciadorFotos.metainfo.xml /app/share/metainfo/com.leobelisario.GerenciadorFotos.metainfo.xml
+      - install -Dm644 com.leobelisario.GerenciadorFotos.svg /app/share/icons/hicolor/scalable/apps/com.leobelisario.GerenciadorFotos.svg
+    sources:
+      - type: file
+        path: main.py
+      - type: dir
+        path: core
+        dest: core
+      - type: dir
+        path: ui
+        dest: ui
+      - type: file
+        path: packaging/gerenciador-fotos
+      - type: file
+        path: packaging/com.leobelisario.GerenciadorFotos.desktop
+      - type: file
+        path: packaging/com.leobelisario.GerenciadorFotos.metainfo.xml
+      - type: file
+        path: packaging/com.leobelisario.GerenciadorFotos.svg
+
+# Preparação:
+#   flatpak install flathub org.gnome.Platform//47 org.gnome.Sdk//47
+# Build, bundle e instalação local:
+#   flatpak-builder --repo=repo --force-clean build-dir com.leobelisario.GerenciadorFotos.yaml
+#   flatpak build-bundle repo GerenciadorFotos.flatpak com.leobelisario.GerenciadorFotos
+#   flatpak install --user --reinstall GerenciadorFotos.flatpak

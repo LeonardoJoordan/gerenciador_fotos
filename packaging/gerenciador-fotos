@@ -1,0 +1,3 @@
+#!/bin/sh
+export PYTHONPATH="/app/share/gerenciador-fotos${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 /app/share/gerenciador-fotos/main.py "$@"

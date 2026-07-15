@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.leobelisario.GerenciadorFotos</id>
+  <name>Gerenciador Semântico de Fotos</name>
+  <summary>Organize fotos por funcionário, unidade e fração</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <developer id="com.leobelisario">
+    <name>Leonardo Belisario</name>
+  </developer>
+  <description>
+    <p>
+      Gerencia galerias de fotos de militares e funcionários com filtros por
+      posto, esquadrão e fração.
+    </p>
+  </description>
+  <content_rating type="oars-1.1"/>
+  <url type="homepage">https://github.com/leobelisario</url>
+  <launchable type="desktop-id">com.leobelisario.GerenciadorFotos.desktop</launchable>
+</component>

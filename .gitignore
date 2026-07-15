@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+ENV/
+
+# Ferramentas de teste, análise e cobertura
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDEs e editores
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Variáveis e configurações locais
+.env
+.env.*
+!.env.example
+
+# Builds Python / Nuitka
+/build/
+/dist/
+*.build/
+*.dist/
+*.onefile-build/
+*.dmg
+
+# Flatpak
+/.flatpak-builder/
+/build-dir/
+/repo/
+*.flatpak
+*.flatpakref
+
+# Cache antigo de miniaturas, caso o projeto seja usado como pasta raiz
+.thumbnails/
+
+# Arquivos do sistema operacional
+.DS_Store
+Thumbs.db
+Desktop.ini
+
