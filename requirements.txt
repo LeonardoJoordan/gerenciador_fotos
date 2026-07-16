@@ -1,2 +1,6 @@
 # Dependência necessária para executar a interface e processar as imagens.
 PySide6==6.11.1
+
+# Ferramentas usadas apenas para gerar a distribuição com script_nuitka.py.
+Nuitka
+ordered-set

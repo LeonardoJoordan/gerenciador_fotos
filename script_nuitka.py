@@ -15,6 +15,10 @@ from pathlib import Path
 
 APP_NAME = "Gerenciador de Fotos de Pessoal"
 EXECUTABLE_NAME = "GerenciadorFotos"
+BUILD_DEPENDENCIES = {
+    "nuitka": "Nuitka",
+    "ordered_set": "ordered-set",
+}
 
 
 def _optional_icon(base_dir: Path, filenames: tuple[str, ...]) -> Path | None:
@@ -92,10 +96,17 @@ def build_app() -> int:
             "Para Linux, use o manifesto Flatpak."
         )
         return 2
-    if importlib.util.find_spec("nuitka") is None:
+    missing_dependencies = [
+        package_name
+        for module_name, package_name in BUILD_DEPENDENCIES.items()
+        if importlib.util.find_spec(module_name) is None
+    ]
+    if missing_dependencies:
+        packages = " ".join(missing_dependencies)
         print(
-            "❌ Nuitka não está instalado neste ambiente. Execute:\n"
-            f'   "{sys.executable}" -m pip install -U nuitka ordered-set zstandard'
+            "❌ Dependências de compilação ausentes: "
+            f"{', '.join(missing_dependencies)}. Execute:\n"
+            f'   "{sys.executable}" -m pip install -U {packages}'
         )
         return 2
 
@@ -113,6 +124,8 @@ def build_app() -> int:
         "--include-qt-plugins=imageformats,platforms,styles",
         "--include-package=core",
         "--include-package=ui",
+        # Mantém os codecs disponíveis mesmo em ambientes Python mínimos.
+        "--include-module=encodings",
         "--follow-imports",
         "--clang",
         "--lto=no",
@@ -126,8 +139,8 @@ def build_app() -> int:
 
     if system == "Windows":
         command.append("--windows-console-mode=disable")
-        # O Nuitka converte o PNG para os formatos necessários do executável.
-        icon = _optional_icon(base_dir, ("icone.png", "icone.ico"))
+        # Prefere o formato nativo para não depender do imageio na conversão.
+        icon = _optional_icon(base_dir, ("icone.ico", "icone.png"))
         if icon:
             command.append(f"--windows-icon-from-ico={icon}")
             print(f"🎨 Ícone do Windows: {icon}")
