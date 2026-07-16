@@ -1,4 +1,4 @@
-"""Gera pacotes standalone do Gerenciador de Fotos no Windows ou macOS.
+"""Gera pacotes standalone do Gerenciador de Fotos de Pessoal.
 
 Execute este script no próprio sistema de destino. O Nuitka não faz
 cross-compilation entre Windows e macOS.
@@ -13,14 +13,15 @@ import sys
 from pathlib import Path
 
 
-APP_NAME = "Gerenciador de Fotos"
+APP_NAME = "Gerenciador de Fotos de Pessoal"
 EXECUTABLE_NAME = "GerenciadorFotos"
 
 
-def _optional_icon(base_dir: Path, extension: str) -> Path | None:
-    candidates = (
-        base_dir / f"icone{extension}",
-        base_dir / "packaging" / f"icone{extension}",
+def _optional_icon(base_dir: Path, filenames: tuple[str, ...]) -> Path | None:
+    candidates = tuple(
+        directory / filename
+        for filename in filenames
+        for directory in (base_dir, base_dir / "packaging")
     )
     return next((path for path in candidates if path.is_file()), None)
 
@@ -125,7 +126,8 @@ def build_app() -> int:
 
     if system == "Windows":
         command.append("--windows-console-mode=disable")
-        icon = _optional_icon(base_dir, ".ico")
+        # O Nuitka converte o PNG para os formatos necessários do executável.
+        icon = _optional_icon(base_dir, ("icone.png", "icone.ico"))
         if icon:
             command.append(f"--windows-icon-from-ico={icon}")
             print(f"🎨 Ícone do Windows: {icon}")
@@ -137,7 +139,7 @@ def build_app() -> int:
                 "--static-libpython=no",
             )
         )
-        icon = _optional_icon(base_dir, ".icns")
+        icon = _optional_icon(base_dir, ("icone.icns", "icone.png"))
         if icon:
             command.append(f"--macos-app-icon={icon}")
             print(f"🎨 Ícone do macOS: {icon}")

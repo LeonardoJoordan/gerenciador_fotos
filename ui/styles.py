@@ -329,6 +329,47 @@ QFrame#photo_card:hover {
     border: 1px solid #3a86ff;
 }
 
+QFrame#photo_card[withoutPhoto="true"] {
+    border: 1px dashed #b66a15;
+}
+
+QFrame#report_metric_card {
+    background-color: #1e1e1e;
+    border: 1px solid #343434;
+    border-radius: 8px;
+    min-height: 92px;
+}
+
+QLabel#report_metric_title {
+    color: #9ca3af;
+    font-size: 12px;
+}
+
+QLabel#report_metric_value {
+    color: #ffffff;
+    font-size: 25px;
+    font-weight: bold;
+}
+
+QTableWidget {
+    background-color: #171717;
+    alternate-background-color: #1d1d1d;
+    color: #ffffff;
+    border: 1px solid #343434;
+    gridline-color: #343434;
+    selection-background-color: #3a86ff;
+}
+
+QHeaderView::section {
+    background-color: #252525;
+    color: #e5e7eb;
+    border: none;
+    border-right: 1px solid #3a3a3a;
+    border-bottom: 1px solid #3a3a3a;
+    padding: 7px;
+    font-weight: bold;
+}
+
 QFrame#gallery_photo {
     background-color: #1e1e1e;
     border: 1px solid #343434;

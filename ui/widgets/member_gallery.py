@@ -29,19 +29,15 @@ class GalleryPhoto(QFrame):
         self.setFixedSize(270, 320)
 
         layout = QVBoxLayout(self)
-        preview = QLabel(self)
-        preview.setFixedSize(248, 185)
-        preview.setAlignment(Qt.AlignCenter)
-        preview.setStyleSheet("background-color: #121212; border-radius: 4px;")
-        pixmap = QPixmap(thumb_path)
-        if not pixmap.isNull():
-            preview.setPixmap(
-                pixmap.scaled(preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
-        else:
-            preview.setText("Imagem indisponível")
-        preview.setToolTip(photo_path)
-        layout.addWidget(preview, 0, Qt.AlignHCenter)
+        self.preview = QLabel(self)
+        self.preview.setFixedSize(248, 185)
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setStyleSheet("background-color: #121212; border-radius: 4px;")
+        self.preview.setText("Carregando miniatura…")
+        self.preview.setToolTip(photo_path)
+        layout.addWidget(self.preview, 0, Qt.AlignHCenter)
+        if thumb_path:
+            self.set_thumbnail(photo_path, thumb_path)
 
         status = QLabel("Foto principal" if primary else os.path.basename(photo_path), self)
         status.setObjectName("primary_photo_label" if primary else "photo_filename_label")
@@ -85,6 +81,18 @@ class GalleryPhoto(QFrame):
         self.style().unpolish(self)
         self.style().polish(self)
         self.selectionChanged.emit(self.photo_path, checked)
+
+    def set_thumbnail(self, photo_path: str, thumbnail_path: str):
+        if os.path.abspath(photo_path) != os.path.abspath(self.photo_path):
+            return
+        pixmap = QPixmap(thumbnail_path)
+        if pixmap.isNull():
+            self.preview.setText("Imagem indisponível")
+            return
+        self.preview.setText("")
+        self.preview.setPixmap(
+            pixmap.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
 
 
 class MemberGalleryDialog(QDialog):
@@ -186,6 +194,7 @@ class MemberGalleryDialog(QDialog):
             if item and item.widget():
                 item.widget().deleteLater()
         primary_path = os.path.abspath(self.member["absolute_path"])
+        self.photo_cards: dict[str, GalleryPhoto] = {}
         for photo in self.member["photos"]:
             card = GalleryPhoto(
                 photo,
@@ -197,6 +206,7 @@ class MemberGalleryDialog(QDialog):
             card.requestRotate.connect(self._request_rotate)
             card.selectionChanged.connect(self._update_selection)
             self.flow.addWidget(card)
+            self.photo_cards[photo] = card
 
     def _update_selection(self, photo_path: str, checked: bool):
         if checked:

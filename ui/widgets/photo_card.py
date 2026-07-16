@@ -1,7 +1,7 @@
 import os
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -125,6 +125,7 @@ class PhotoCard(QFrame):
     requestMove = Signal(str, str, str)
     requestEdit = Signal(str, str, str, str, str)
     requestGallery = Signal(object)
+    requestAddPhotos = Signal(object, object)
 
     def __init__(self, member_data: dict, thumb_path: str, config: dict, parent=None):
         super().__init__(parent)
@@ -133,6 +134,8 @@ class PhotoCard(QFrame):
         self.config = config
         self.structure = config.get("esquadroes", {})
         self.setObjectName("photo_card")
+        self.setProperty("withoutPhoto", self.data.get("photo_count", 0) == 0)
+        self.setAcceptDrops(True)
         self.setFixedSize(200, 350)
         self.init_ui()
 
@@ -150,8 +153,10 @@ class PhotoCard(QFrame):
             self.img_label.setPixmap(
                 pixmap.scaled(self.img_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             )
+        elif self.data.get("photo_count", 0) > 0:
+            self.img_label.setText("Carregando miniatura…")
         else:
-            self.img_label.setText("Sem Foto")
+            self.img_label.setText("Foto pendente\n\nArraste uma imagem aqui")
 
         self.name_label = QLabel(
             f"{self.data['posto_grad']} {self.data['nome_guerra']}", self
@@ -197,10 +202,13 @@ class PhotoCard(QFrame):
         edit_button.setObjectName("card_edit_btn")
         edit_button.clicked.connect(self._edit_member)
 
-        photo_count = QLabel(f"{self.data.get('photo_count', 1)} foto(s)", self)
+        count = self.data.get("photo_count", 0)
+        photo_count = QLabel(
+            "Sem fotos" if count == 0 else f"{count} foto(s)", self
+        )
         photo_count.setObjectName("photo_count_label")
         photo_count.setAlignment(Qt.AlignCenter)
-        gallery_button = QPushButton("Galeria", self)
+        gallery_button = QPushButton("Adicionar foto" if count == 0 else "Galeria", self)
         gallery_button.setObjectName("card_edit_btn")
         gallery_button.clicked.connect(lambda: self.requestGallery.emit(self.data))
 
@@ -214,6 +222,16 @@ class PhotoCard(QFrame):
         layout.addLayout(tags_layout)
         layout.addLayout(actions)
 
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if any(url.isLocalFile() for url in event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent):
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        if paths:
+            self.requestAddPhotos.emit(self.data, paths)
+            event.acceptProposedAction()
+
     def _squadron_label(self, squadron: str) -> str:
         return (
             self.config.get("abreviacoes", {})
@@ -226,6 +244,19 @@ class PhotoCard(QFrame):
         squadron = self.data["esquadrao"]
         abbreviation = abbreviations.get(squadron, {}).get(section, "").strip()
         return abbreviation or section
+
+    def set_thumbnail(self, photo_path: str, thumbnail_path: str):
+        """Atualiza a imagem quando o worker terminar, já na thread da interface."""
+        if os.path.abspath(photo_path) != os.path.abspath(self.data["absolute_path"]):
+            return
+        pixmap = QPixmap(thumbnail_path)
+        if pixmap.isNull():
+            self.img_label.setText("Sem Foto")
+            return
+        self.img_label.setText("")
+        self.img_label.setPixmap(
+            pixmap.scaled(self.img_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
 
     def _on_tag_changed(self, tag_type: str, new_value: str):
         squadron = self.data["esquadrao"]

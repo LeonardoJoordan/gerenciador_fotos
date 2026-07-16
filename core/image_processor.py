@@ -45,7 +45,9 @@ class ImageProcessor:
         os.makedirs(cache_path, exist_ok=True)
         return cache_path
 
-    def get_thumbnail_path(self, root_path: str, original_file_path: str) -> str:
+    def get_thumbnail_path(
+        self, root_path: str, original_file_path: str, size: int = 150
+    ) -> str:
         """Gera um caminho único para a miniatura baseado no caminho relativo do arquivo original."""
         cache_dir = self.get_cache_dir(root_path)
         
@@ -54,8 +56,10 @@ class ImageProcessor:
         )
         # A versão faz miniaturas antigas, criadas sem orientação EXIF, serem
         # naturalmente substituídas sem precisar apagar o cache do usuário.
-        digest = hashlib.sha256(f"orientation-v2\0{relative_path}".encode("utf-8")).hexdigest()
-        return os.path.join(cache_dir, f"{digest}.jpg")
+        digest = hashlib.sha256(
+            f"orientation-v3\0{relative_path}".encode("utf-8")
+        ).hexdigest()
+        return os.path.join(cache_dir, f"{digest}-{size}.jpg")
 
     def load_oriented_pixmap(self, image_path: str) -> QPixmap:
         """Carrega a imagem aplicando a orientação registrada pela câmera."""
@@ -71,12 +75,14 @@ class ImageProcessor:
         Gera uma miniatura otimizada da imagem original e salva no cache.
         Retorna o caminho para a miniatura gerada.
         """
-        thumb_path = self.get_thumbnail_path(root_path, original_file_path)
-
-        # Se a miniatura já existe e é mais recente que o arquivo original, reutiliza ela
-        if os.path.exists(thumb_path):
-            if os.path.getmtime(thumb_path) >= os.path.getmtime(original_file_path):
-                return thumb_path
+        cached_path = self.get_cached_thumbnail(root_path, original_file_path, size)
+        if cached_path:
+            return cached_path
+        thumb_path = self.get_thumbnail_path(root_path, original_file_path, size)
+        try:
+            source_mtime = os.path.getmtime(original_file_path)
+        except OSError:
+            return ""
 
         # QImageReader é extremamente rápido porque ele lê apenas o tamanho antes de carregar toda a imagem na RAM
         reader = QImageReader(original_file_path)
@@ -88,6 +94,8 @@ class ImageProcessor:
         orig_size = reader.size()
         orig_width = orig_size.width()
         orig_height = orig_size.height()
+        if orig_width <= 0 or orig_height <= 0:
+            return ""
 
         if orig_width > orig_height:
             new_width = size
@@ -100,19 +108,61 @@ class ImageProcessor:
         image = reader.read()
 
         if not image.isNull():
-            # Salva a miniatura compactada como JPEG para economizar espaço e carregar rápido
-            image.save(thumb_path, "JPG", 80)
-            return thumb_path
+            try:
+                if os.path.getmtime(original_file_path) != source_mtime:
+                    return ""
+            except OSError:
+                return ""
+            temporary_path = f"{thumb_path}.{uuid.uuid4().hex}.tmp"
+            try:
+                if not image.save(temporary_path, "JPG", 80):
+                    return ""
+                if os.path.getmtime(original_file_path) != source_mtime:
+                    return ""
+                os.replace(temporary_path, thumb_path)
+                return thumb_path
+            except OSError:
+                return ""
+            finally:
+                if os.path.exists(temporary_path):
+                    os.remove(temporary_path)
 
+        return ""
+
+    def get_cached_thumbnail(
+        self, root_path: str, original_file_path: str, size: int = 150
+    ) -> str:
+        """Retorna somente um cache válido, sem decodificar a imagem original."""
+        if not os.path.isfile(original_file_path):
+            return ""
+        thumb_path = self.get_thumbnail_path(root_path, original_file_path, size)
+        try:
+            if (
+                os.path.isfile(thumb_path)
+                and os.path.getmtime(thumb_path) >= os.path.getmtime(original_file_path)
+            ):
+                return thumb_path
+        except OSError:
+            return ""
         return ""
 
     def invalidate_thumbnail(self, root_path: str, original_file_path: str) -> None:
         """Remove do cache a miniatura ligada a um caminho antigo."""
         if not root_path:
             return
-        thumb_path = self.get_thumbnail_path(root_path, original_file_path)
-        if os.path.isfile(thumb_path):
-            os.remove(thumb_path)
+        cache_dir = self.get_cache_dir(root_path)
+        relative_path = os.path.normcase(
+            os.path.relpath(os.path.abspath(original_file_path), os.path.abspath(root_path))
+        )
+        digest = hashlib.sha256(
+            f"orientation-v3\0{relative_path}".encode("utf-8")
+        ).hexdigest()
+        for filename in os.listdir(cache_dir):
+            if filename.startswith(f"{digest}-") and filename.endswith(".jpg"):
+                try:
+                    os.remove(os.path.join(cache_dir, filename))
+                except OSError:
+                    pass
 
     def refresh_thumbnail(self, root_path: str, original_file_path: str, size: int = 150) -> str:
         """Força a recriação de uma miniatura após uma edição."""

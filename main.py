@@ -8,7 +8,7 @@ def main():
     app = QApplication(sys.argv)
     
     # Define o nome da aplicação para o sistema operacional
-    app.setApplicationName("Gerenciador Semântico de Fotos")
+    app.setApplicationName("Gerenciador de Fotos de Pessoal")
     app.setOrganizationName("ComSoc")
 
     # Instancia a janela principal que construímos em ui/main_window.py

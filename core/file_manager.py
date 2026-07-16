@@ -97,6 +97,7 @@ def _supported_photo_extensions() -> set[str]:
 class FileManager:
     VALID_EXTENSIONS = _supported_photo_extensions()
     CONFIG_FILENAME = "config.json"
+    MEMBER_MARKER = ".cadastro"
 
     def __init__(self, root_path: str = ""):
         self.root_path = os.path.abspath(root_path) if root_path else ""
@@ -118,13 +119,14 @@ class FileManager:
     def config_path(self) -> str:
         if not self.root_path:
             raise ValueError("Diretório raiz de trabalho não definido.")
-        return os.path.join(root_config_dir(self.root_path), self.CONFIG_FILENAME)
+        return os.path.join(self.root_path, self.CONFIG_FILENAME)
 
     @property
-    def legacy_config_path(self) -> str:
+    def external_config_path(self) -> str:
+        """Local usado por versões que escondiam o JSON nos dados do aplicativo."""
         if not self.root_path:
             raise ValueError("Diretório raiz de trabalho não definido.")
-        return os.path.join(self.root_path, self.CONFIG_FILENAME)
+        return os.path.join(root_config_dir(self.root_path), self.CONFIG_FILENAME)
 
     def load_config(self) -> Dict[str, Any]:
         """Lê a configuração da raiz ou cria uma configuração inicial."""
@@ -133,11 +135,11 @@ class FileManager:
         os.makedirs(self.root_path, exist_ok=True)
 
         source_path = self.config_path
-        migrating_legacy_config = False
+        migrating_external_config = False
         if not os.path.exists(source_path):
-            if os.path.isfile(self.legacy_config_path):
-                source_path = self.legacy_config_path
-                migrating_legacy_config = True
+            if os.path.isfile(self.external_config_path):
+                source_path = self.external_config_path
+                migrating_external_config = True
             else:
                 return self.save_config(self._infer_config_from_directory())
 
@@ -149,8 +151,14 @@ class FileManager:
 
         normalized = self._normalize_config(loaded)
         # Migra configurações antigas adicionando o bloco de abreviações no próprio JSON.
-        if migrating_legacy_config or normalized != loaded:
-            return self.save_config(normalized)
+        if migrating_external_config or normalized != loaded:
+            saved = self.save_config(normalized)
+            if migrating_external_config:
+                try:
+                    os.remove(self.external_config_path)
+                except OSError:
+                    pass
+            return saved
         self.config = normalized
         return deepcopy(self.config)
 
@@ -202,6 +210,8 @@ class FileManager:
     def _directory_is_member(self, directory: Path) -> bool:
         if not directory.is_dir():
             return False
+        if (directory / self.MEMBER_MARKER).is_file():
+            return True
         prefix = f"{directory.name}_".casefold()
         return any(
             child.is_file()
@@ -331,6 +341,15 @@ class FileManager:
                 for directory in dirs
                 if directory != ".thumbnails" and not directory.startswith(".delete-")
             ]
+            for directory in dirs:
+                member_path = Path(root) / directory
+                if not self._directory_is_member(member_path):
+                    continue
+                modern = self._parse_member_directory(str(member_path))
+                if modern:
+                    grouped_members.setdefault(
+                        os.path.normcase(modern["member_path"]), modern
+                    )
             for filename in files:
                 if Path(filename).suffix.lower() not in self.VALID_EXTENSIONS:
                     continue
@@ -347,6 +366,7 @@ class FileManager:
                         "member_path": item["absolute_path"],
                         "photos": [item["absolute_path"]],
                         "photo_count": 1,
+                        "has_photo": True,
                         "is_legacy": True,
                     })
                     items.append(item)
@@ -354,8 +374,13 @@ class FileManager:
         for member in grouped_members.values():
             member["photos"].sort(key=self._photo_sort_key)
             member["photo_count"] = len(member["photos"])
-            member["absolute_path"] = self._primary_photo(member["photos"])
-            member["filename"] = os.path.basename(member["absolute_path"])
+            member["has_photo"] = bool(member["photos"])
+            if member["photos"]:
+                member["absolute_path"] = self._primary_photo(member["photos"])
+                member["filename"] = os.path.basename(member["absolute_path"])
+            else:
+                member["absolute_path"] = ""
+                member["filename"] = ""
             items.append(member)
         rank_order = {
             rank.casefold(): index
@@ -384,18 +409,31 @@ class FileManager:
         if not match or match.group(1).casefold() != member_folder.casefold():
             return None
 
+        member = self._parse_member_directory(os.path.dirname(file_path))
+        if not member:
+            return None
+        return member
+
+    def _parse_member_directory(self, member_path: str) -> Dict[str, Any] | None:
+        """Extrai um cadastro moderno, inclusive quando sua pasta ainda está vazia."""
+        rel_path = os.path.relpath(member_path, self.root_path)
+        parts = Path(rel_path).parts
+        if len(parts) < 2:
+            return None
+        member_folder = parts[-1]
         posto_grad, nome_guerra = self._split_identity(member_folder)
         if posto_grad == "Indefinido":
             return None
-        location = parts[:-2]
+        location = parts[:-1]
         esquadrao = location[0] if location else "Sem Categoria"
         fracao = location[1] if len(location) >= 2 else ""
         return {
-            "absolute_path": os.path.abspath(file_path),
-            "filename": os.path.basename(file_path),
-            "member_path": os.path.abspath(os.path.dirname(file_path)),
+            "absolute_path": "",
+            "filename": "",
+            "member_path": os.path.abspath(member_path),
             "photos": [],
             "photo_count": 0,
+            "has_photo": False,
             "is_legacy": False,
             "esquadrao": esquadrao,
             "fracao": fracao,
@@ -501,16 +539,39 @@ class FileManager:
             dest_dir = os.path.join(dest_dir, fracao)
         member_dir = os.path.join(dest_dir, identity)
         os.makedirs(member_dir, exist_ok=True)
+        self._ensure_member_marker(member_dir)
         index = self._next_photo_index(member_dir)
         destination = os.path.join(member_dir, f"{identity}_{index:02d}{extension}")
         self._ensure_destination_available(destination)
         shutil.copy2(source_path, destination)
         return destination
 
+    def create_member(
+        self,
+        posto_grad: str,
+        nome_guerra: str,
+        esquadrao: str,
+        fracao: str = "",
+    ) -> str:
+        """Cria um cadastro portátil ainda sem fotografias."""
+        self._require_root()
+        identity = self._build_identity(posto_grad, nome_guerra)
+        esquadrao = self._path_part(esquadrao, "Esquadrão")
+        fracao = self._path_part(fracao, "Fração", allow_empty=True)
+        destination_dir = os.path.join(self.root_path, esquadrao)
+        if fracao:
+            destination_dir = os.path.join(destination_dir, fracao)
+        member_dir = os.path.join(destination_dir, identity)
+        self._ensure_destination_available(member_dir)
+        os.makedirs(member_dir)
+        self._ensure_member_marker(member_dir)
+        return member_dir
+
     def add_photos(self, member_path: str, source_paths: List[str]) -> List[str]:
         self._require_root()
         if not os.path.isdir(member_path):
             raise ValueError("O cadastro precisa ser convertido para o novo formato.")
+        self._ensure_member_marker(member_path)
         identity = os.path.basename(member_path)
         next_index = self._next_photo_index(member_path)
         destinations = []
@@ -549,6 +610,7 @@ class FileManager:
         )
         try:
             shutil.move(current_path, destination)
+            self._ensure_member_marker(member_dir)
         except Exception:
             if os.path.isdir(member_dir) and not os.listdir(member_dir):
                 os.rmdir(member_dir)
@@ -650,8 +712,8 @@ class FileManager:
             raise
 
         shutil.rmtree(stage_dir)
-        if not remaining and os.path.isdir(member_path) and not os.listdir(member_path):
-            os.rmdir(member_path)
+        if not remaining and os.path.isdir(member_path):
+            self._ensure_member_marker(member_path)
 
     def _delete_with_staging(self, files: List[tuple[str, str]]) -> None:
         parent = os.path.dirname(files[0][0])
@@ -819,6 +881,11 @@ class FileManager:
         if clean in {".", ".."} or any(char in clean for char in "/\\"):
             raise ValueError(f"{label} contém caracteres inválidos.")
         return clean
+
+    @classmethod
+    def _ensure_member_marker(cls, member_path: str) -> None:
+        marker_path = os.path.join(member_path, cls.MEMBER_MARKER)
+        Path(marker_path).touch(exist_ok=True)
 
     @staticmethod
     def _ensure_destination_available(destination: str) -> None:

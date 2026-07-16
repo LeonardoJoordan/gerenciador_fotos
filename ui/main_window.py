@@ -1,8 +1,9 @@
 import os
 import shutil
+import weakref
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtCore import QSettings, QThreadPool, Qt, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QTransform
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -29,12 +30,20 @@ from PySide6.QtWidgets import (
 
 from core.file_manager import FileManager
 from core.image_processor import ImageProcessor
+from core.report_service import ReportService
+from core.roster_csv import RosterCsv
+from core.thumbnail_worker import ThumbnailWorker
 from ui.styles import STYLE_SHEET
 from ui.widgets.filter_button_grid import FilterButtonGrid, GroupedFilterButtonGrid
 from ui.widgets.flow_layout import FlowLayout
 from ui.widgets.photo_card import PhotoCard
+from ui.widgets.report_dashboard import ReportDashboard
+from ui.widgets.roster_import_dialog import RosterImportDialog
 from ui.widgets.member_gallery import MemberGalleryDialog
 from ui.widgets.selection_button_grid import SelectionButtonGrid
+
+
+LEGACY_SETTINGS_APPLICATION = "Gerenciador Semântico de Fotos"
 
 
 class DropArea(QFrame):
@@ -78,7 +87,7 @@ class DropArea(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Gerenciador Semântico de Fotos")
+        self.setWindowTitle("Gerenciador de Fotos de Pessoal")
         self.setStyleSheet(STYLE_SHEET)
 
         self.file_manager = FileManager()
@@ -92,6 +101,10 @@ class MainWindow(QMainWindow):
         self.members_data = []
         self.import_source_path = ""
         self.import_rotation = 0
+        self.thumbnail_pool = QThreadPool(self)
+        self.thumbnail_pool.setMaxThreadCount(4)
+        self._thumbnail_jobs = {}
+        self._thumbnail_targets = {}
         self.init_ui()
         self.restore_last_root_directory()
 
@@ -115,6 +128,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget(self)
         self.tabs.addTab(self._build_import_tab(), "Importação Rápida")
         self.tabs.addTab(self._build_gallery_tab(), "Galeria e Filtros")
+        self.tabs.addTab(self._build_reports_tab(), "Relatórios")
         self.tabs.addTab(self._build_settings_tab(), "Configurações")
         self.tabs.setEnabled(False)
         root_layout.addWidget(self.tabs, 1)
@@ -200,7 +214,10 @@ class MainWindow(QMainWindow):
         form.addWidget(self.import_section_buttons)
         right.addLayout(form)
         right.addStretch()
-        self.btn_save_import = QPushButton("Salvar Foto", self)
+        batch_registration_button = QPushButton("Cadastrar em lote", self)
+        batch_registration_button.clicked.connect(self.open_batch_registration)
+        right.addWidget(batch_registration_button)
+        self.btn_save_import = QPushButton("Salvar", self)
         self.btn_save_import.setObjectName("primary_btn")
         self.btn_save_import.clicked.connect(self.save_import)
         right.addWidget(self.btn_save_import)
@@ -208,6 +225,98 @@ class MainWindow(QMainWindow):
         layout.addLayout(left, 3)
         layout.addWidget(right_panel, 2)
         return tab
+
+    def open_batch_registration(self):
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Cadastrar em lote")
+        dialog.setIcon(QMessageBox.Information)
+        dialog.setText("Como deseja realizar o cadastro em lote?")
+        dialog.setInformativeText(
+            "Exporte o modelo baseado na estrutura atual, preencha-o e depois volte "
+            "para importar a relação pronta."
+        )
+        import_button = dialog.addButton(
+            "Importar relação preenchida", QMessageBox.ActionRole
+        )
+        template_button = dialog.addButton("Exportar modelo CSV", QMessageBox.ActionRole)
+        dialog.addButton("Cancelar", QMessageBox.RejectRole)
+        dialog.exec()
+
+        if dialog.clickedButton() is import_button:
+            self.import_roster_csv()
+        elif dialog.clickedButton() is template_button:
+            self.export_roster_template()
+
+    def export_roster_template(self):
+        suggested_path = os.path.join(
+            self.root_directory, RosterCsv.TEMPLATE_FILENAME
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Exportar modelo de cadastro em lote",
+            suggested_path,
+            "Relações CSV (*.csv)",
+        )
+        if not path:
+            return
+        try:
+            written_path = RosterCsv.write_template(path, self.config)
+        except Exception as exc:
+            self._show_error("Não foi possível exportar o modelo", exc)
+            return
+        QMessageBox.information(
+            self,
+            "Modelo exportado",
+            f"O modelo de cadastro em lote foi salvo em:\n{written_path}",
+        )
+
+    def import_roster_csv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Selecionar relação", "", "Relações CSV (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            rows = RosterCsv.read(path, self.config)
+        except Exception as exc:
+            self._show_error("CSV inválido", exc)
+            return
+        dialog = RosterImportDialog(rows, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        existing = {
+            (
+                member["posto_grad"].casefold(),
+                member["nome_guerra"].casefold(),
+                member["esquadrao"].casefold(),
+                member["fracao"].casefold(),
+            )
+            for member in self.members_data
+        }
+        created = 0
+        skipped = 0
+        for row in dialog.valid_rows():
+            values = {
+                key: row[key]
+                for key in ("posto_grad", "nome_guerra", "esquadrao", "fracao")
+            }
+            key = tuple(values[field].casefold() for field in values)
+            if key in existing:
+                skipped += 1
+                continue
+            try:
+                self.file_manager.create_member(**values)
+                existing.add(key)
+                created += 1
+            except FileExistsError:
+                skipped += 1
+        self.reload_data()
+        QMessageBox.information(
+            self,
+            "Relação importada",
+            f"{created} cadastro(s) criado(s).\n{skipped} duplicado(s) ignorado(s).",
+        )
 
     def select_import_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -249,9 +358,6 @@ class MainWindow(QMainWindow):
         self.import_section_buttons.set_options(sections)
 
     def save_import(self):
-        if not self.import_source_path:
-            QMessageBox.warning(self, "Foto obrigatória", "Selecione ou arraste uma foto.")
-            return
         values = {
             "posto_grad": self.import_rank_buttons.currentText().strip(),
             "nome_guerra": self.import_name_input.text().strip(),
@@ -272,6 +378,13 @@ class MainWindow(QMainWindow):
             None,
         )
         if existing:
+            if not self.import_source_path:
+                QMessageBox.warning(
+                    self,
+                    "Cadastro já existente",
+                    "Este militar já está cadastrado nesta unidade.",
+                )
+                return
             answer = QMessageBox.question(
                 self,
                 "Funcionário já cadastrado",
@@ -282,7 +395,9 @@ class MainWindow(QMainWindow):
                 return
         destination = ""
         try:
-            if existing:
+            if not self.import_source_path:
+                self.file_manager.create_member(**values)
+            elif existing:
                 member_path = existing["member_path"]
                 if existing.get("is_legacy"):
                     self.image_processor.invalidate_thumbnail(
@@ -296,9 +411,8 @@ class MainWindow(QMainWindow):
                 destination = self.file_manager.import_and_format_photo(
                     self.import_source_path, **values
                 )
-            if self.import_rotation:
+            if destination and self.import_rotation:
                 self.image_processor.rotate_image_file(destination, self.import_rotation)
-            self.image_processor.create_thumbnail(self.root_directory, destination)
         except Exception as exc:
             if destination and os.path.isfile(destination):
                 self.image_processor.invalidate_thumbnail(
@@ -312,7 +426,13 @@ class MainWindow(QMainWindow):
             return
         self.clear_import_form()
         self.reload_data()
-        QMessageBox.information(self, "Foto salva", "A foto foi importada e organizada com sucesso.")
+        QMessageBox.information(
+            self,
+            "Cadastro salvo",
+            "A foto foi importada e organizada com sucesso."
+            if destination
+            else "O cadastro sem foto foi criado com sucesso.",
+        )
 
     def clear_import_form(self):
         self.import_source_path = ""
@@ -339,6 +459,14 @@ class MainWindow(QMainWindow):
         filters.setContentsMargins(16, 20, 16, 20)
         filters.setSpacing(11)
         filters.addWidget(self._title("Filtros dinâmicos"))
+
+        self.btn_all_photo_status = self._filter_toggle_button()
+        filters.addLayout(
+            self._filter_header("Situação da foto", self.btn_all_photo_status)
+        )
+        self.filter_photo_buttons = FilterButtonGrid(columns=2, parent=self)
+        filters.addWidget(self.filter_photo_buttons)
+
         self.search_input = QLineEdit(self)
         self.search_input.setPlaceholderText("Buscar pelo nome...")
         filters.addWidget(QLabel("Busca rápida", self))
@@ -393,10 +521,14 @@ class MainWindow(QMainWindow):
         filters.addStretch()
 
         self.search_input.textChanged.connect(self.populate_gallery)
+        self.filter_photo_buttons.selectionChanged.connect(
+            self._on_photo_filters_changed
+        )
         self.filter_rank_buttons.selectionChanged.connect(self._on_rank_filters_changed)
         self.filter_squadron_buttons.selectionChanged.connect(self._on_squadron_filters_changed)
         self.filter_section_buttons.selectionChanged.connect(self._on_section_filters_changed)
         self.btn_all_ranks.clicked.connect(self._toggle_all_ranks)
+        self.btn_all_photo_status.clicked.connect(self._toggle_all_photo_status)
         self.btn_all_squadrons.clicked.connect(self._toggle_all_squadrons)
         self.btn_all_sections.clicked.connect(self._toggle_all_sections)
 
@@ -427,6 +559,7 @@ class MainWindow(QMainWindow):
         return tab
 
     def refresh_filter_options(self):
+        first_photo_load = self.filter_photo_buttons.count() == 0
         first_rank_load = self.filter_rank_buttons.count() == 0
         first_squadron_load = self.filter_squadron_buttons.count() == 0
         first_section_load = self.filter_section_buttons.count() == 0
@@ -434,9 +567,16 @@ class MainWindow(QMainWindow):
         squadron_selection = self.filter_squadron_buttons.selected_values()
         rank_all = self.filter_rank_buttons.all_selected()
         squadron_all = self.filter_squadron_buttons.all_selected()
+        photo_selection = self.filter_photo_buttons.selected_values()
+        photo_all = self.filter_photo_buttons.all_selected()
 
         configured_ranks = self.config.get("postos_graduacoes", [])
         configured_squadrons = self.config.get("esquadroes", {}).keys()
+        self.filter_photo_buttons.set_options(
+            ["Com foto", "Sem foto"],
+            photo_selection,
+            all_mode=photo_all or first_photo_load,
+        )
         self.filter_rank_buttons.set_options(
             configured_ranks,
             rank_selection,
@@ -463,10 +603,20 @@ class MainWindow(QMainWindow):
         self.filter_unrecognized_button.setChecked(False)
         if (
             self.filter_rank_buttons.selected_values()
+            and not self.filter_photo_buttons.selected_values()
+        ):
+            self.filter_photo_buttons.select_all(emit=False)
+        if (
+            self.filter_rank_buttons.selected_values()
             and not self.filter_squadron_buttons.selected_values()
         ):
             self.filter_squadron_buttons.select_all(emit=False)
             self._refresh_fraction_filters(force_all=True)
+        self._update_filter_toggle_labels()
+        self.populate_gallery()
+
+    def _on_photo_filters_changed(self):
+        self.filter_unrecognized_button.setChecked(False)
         self._update_filter_toggle_labels()
         self.populate_gallery()
 
@@ -484,6 +634,7 @@ class MainWindow(QMainWindow):
 
     def _on_unrecognized_filter_toggled(self, checked: bool):
         if checked:
+            self.filter_photo_buttons.clear_selection(emit=False)
             self.filter_rank_buttons.clear_selection(emit=False)
             self.filter_squadron_buttons.clear_selection(emit=False)
             self.filter_section_buttons.clear_selection(emit=False)
@@ -496,6 +647,12 @@ class MainWindow(QMainWindow):
             self.filter_rank_buttons.clear_selection()
         else:
             self.filter_rank_buttons.select_all()
+
+    def _toggle_all_photo_status(self):
+        if self.filter_photo_buttons.all_selected():
+            self.filter_photo_buttons.clear_selection()
+        else:
+            self.filter_photo_buttons.select_all()
 
     def _toggle_all_squadrons(self):
         if self.filter_squadron_buttons.all_selected():
@@ -538,6 +695,9 @@ class MainWindow(QMainWindow):
         self.filter_section_buttons.setVisible(bool(selected_squadrons))
 
     def _update_filter_toggle_labels(self):
+        self._set_filter_toggle_label(
+            self.btn_all_photo_status, self.filter_photo_buttons
+        )
         self._set_filter_toggle_label(self.btn_all_ranks, self.filter_rank_buttons)
         self._set_filter_toggle_label(self.btn_all_squadrons, self.filter_squadron_buttons)
         self._set_filter_toggle_label(self.btn_all_sections, self.filter_section_buttons)
@@ -554,6 +714,7 @@ class MainWindow(QMainWindow):
         ranks = set(self.filter_rank_buttons.selected_values())
         squadrons = set(self.filter_squadron_buttons.selected_values())
         sections = set(self.filter_section_buttons.selected_values())
+        photo_statuses = set(self.filter_photo_buttons.selected_values())
         configured_structure = self.config.get("esquadroes", {})
         show_unrecognized = self.filter_unrecognized_button.isChecked()
         shown = 0
@@ -565,6 +726,9 @@ class MainWindow(QMainWindow):
                 if not self._member_is_unrecognized(member):
                     continue
             else:
+                member_status = "Com foto" if member.get("photo_count", 0) else "Sem foto"
+                if member_status not in photo_statuses:
+                    continue
                 if not ranks or member["posto_grad"] not in ranks:
                     continue
                 if not squadrons or member["esquadrao"] not in squadrons:
@@ -584,7 +748,7 @@ class MainWindow(QMainWindow):
                     # mas não contamina a lista de filtros nem o config.json.
                     continue
 
-            thumb_path = self.image_processor.create_thumbnail(
+            thumb_path = self.image_processor.get_cached_thumbnail(
                 self.root_directory, member["absolute_path"]
             )
             card = PhotoCard(
@@ -596,7 +760,10 @@ class MainWindow(QMainWindow):
             card.requestMove.connect(self.handle_member_move)
             card.requestEdit.connect(self.handle_member_edit)
             card.requestGallery.connect(self.open_member_gallery)
+            card.requestAddPhotos.connect(self.handle_card_add_photos)
             self.flow_layout.addWidget(card)
+            if member["absolute_path"] and not thumb_path:
+                self._queue_thumbnail(member["absolute_path"], 150, card)
             shown += 1
         self.lbl_section.setText(f"Militares ({shown})")
 
@@ -637,16 +804,78 @@ class MainWindow(QMainWindow):
 
     def open_member_gallery(self, member: dict):
         thumbnail_paths = {
-            photo: self.image_processor.create_thumbnail(self.root_directory, photo, 210)
+            photo: self.image_processor.get_cached_thumbnail(
+                self.root_directory, photo, 210
+            )
             for photo in member["photos"]
         }
         dialog = MemberGalleryDialog(member, thumbnail_paths, self)
+        self._queue_gallery_thumbnails(dialog)
         dialog.requestAdd.connect(self.handle_gallery_add)
         dialog.requestPrimary.connect(self.handle_set_primary)
         dialog.requestRotate.connect(self.handle_rotate_gallery_photo)
         dialog.requestExport.connect(self.handle_export_photos)
         dialog.requestDelete.connect(self.handle_delete_photos)
         dialog.exec()
+
+    def handle_card_add_photos(self, member: dict, paths: list[str]):
+        valid_paths = [
+            path
+            for path in paths
+            if os.path.isfile(path)
+            and Path(path).suffix.lower() in FileManager.VALID_EXTENSIONS
+        ]
+        if not valid_paths:
+            QMessageBox.warning(self, "Imagem inválida", "Nenhuma imagem suportada foi solta.")
+            return
+        try:
+            member_path = member["member_path"]
+            if member.get("is_legacy"):
+                self.image_processor.invalidate_thumbnail(
+                    self.root_directory, member["absolute_path"]
+                )
+                member_path = self.file_manager.convert_legacy_member(member_path)
+            self.file_manager.add_photos(member_path, valid_paths)
+            self.reload_data()
+        except Exception as exc:
+            self._show_error("Erro ao adicionar fotos", exc)
+            self.reload_data()
+
+    def _build_reports_tab(self) -> QWidget:
+        self.report_dashboard = ReportDashboard(self)
+        self.report_dashboard.requestOpenMember.connect(self.open_member_gallery)
+        self.report_dashboard.requestAddPhoto.connect(self.handle_report_add_photo)
+        self.report_dashboard.requestExport.connect(self.export_reports)
+        return self.report_dashboard
+
+    def handle_report_add_photo(self, member: dict):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Adicionar fotos", "", FileManager.image_dialog_filter()
+        )
+        if paths:
+            self.handle_card_add_photos(member, paths)
+
+    def export_reports(self, context: dict):
+        suggested_filename = ReportService.export_filename(context)
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Exportar visualização do relatório",
+            suggested_filename,
+            "Relatórios CSV (*.csv)",
+        )
+        if not path:
+            return
+        try:
+            written = ReportService.export_view(
+                path, self.members_data, self.config, context
+            )
+            QMessageBox.information(
+                self,
+                "Relatório exportado",
+                f"A visualização atual foi salva em:\n{written}",
+            )
+        except Exception as exc:
+            self._show_error("Erro ao exportar relatório", exc)
 
     def handle_gallery_add(self, member: dict):
         dialog = self.sender()
@@ -675,8 +904,6 @@ class MainWindow(QMainWindow):
                 # precisar fechar e reabrir a galeria.
                 os.makedirs(member_path, exist_ok=True)
             destinations = self.file_manager.add_photos(member_path, paths)
-            for destination in destinations:
-                self.image_processor.create_thumbnail(self.root_directory, destination)
             self.reload_data()
             self._refresh_gallery_dialog(dialog, member_path)
             QMessageBox.information(
@@ -834,12 +1061,13 @@ class MainWindow(QMainWindow):
         )
         if updated_member:
             thumbnail_paths = {
-                photo: self.image_processor.create_thumbnail(
+                photo: self.image_processor.get_cached_thumbnail(
                     self.root_directory, photo, 210
                 )
                 for photo in updated_member["photos"]
             }
             dialog.refresh_member(updated_member, thumbnail_paths)
+            self._queue_gallery_thumbnails(dialog)
         elif empty_member is not None:
             empty = dict(empty_member)
             empty.update(
@@ -861,6 +1089,49 @@ class MainWindow(QMainWindow):
                 for photo in member["photos"]:
                     self.image_processor.invalidate_thumbnail(self.root_directory, photo)
                 return
+
+    def _queue_gallery_thumbnails(self, dialog: MemberGalleryDialog):
+        for photo, card in dialog.photo_cards.items():
+            if not self.image_processor.get_cached_thumbnail(
+                self.root_directory, photo, 210
+            ):
+                self._queue_thumbnail(photo, 210, card)
+
+    def _queue_thumbnail(self, photo_path: str, size: int, target: QWidget):
+        cached = self.image_processor.get_cached_thumbnail(
+            self.root_directory, photo_path, size
+        )
+        if cached:
+            target.set_thumbnail(photo_path, cached)
+            return
+
+        key = (
+            os.path.realpath(self.root_directory),
+            os.path.realpath(photo_path),
+            size,
+        )
+        self._thumbnail_targets.setdefault(key, []).append(weakref.ref(target))
+        if key in self._thumbnail_jobs:
+            return
+        worker = ThumbnailWorker(
+            key, self.root_directory, photo_path, size
+        )
+        self._thumbnail_jobs[key] = worker
+        worker.signals.finished.connect(self._thumbnail_finished)
+        self.thumbnail_pool.start(worker)
+
+    def _thumbnail_finished(self, key, photo_path: str, thumbnail_path: str):
+        self._thumbnail_jobs.pop(key, None)
+        targets = self._thumbnail_targets.pop(key, [])
+        for target_ref in targets:
+            target = target_ref()
+            if target is None:
+                continue
+            try:
+                target.set_thumbnail(photo_path, thumbnail_path)
+            except RuntimeError:
+                # O card pode ter sido destruído por uma troca rápida de filtro.
+                pass
 
     # --------------------------------------------------------------- Configurações
     def _build_settings_tab(self) -> QWidget:
@@ -1140,6 +1411,7 @@ class MainWindow(QMainWindow):
         self.refresh_config_dependent_ui()
         self.refresh_filter_options()
         self.populate_gallery()
+        self.report_dashboard.refresh(self.members_data, self.config)
         QMessageBox.information(self, "Estrutura salva", "O config.json foi atualizado.")
 
     def _store_visible_sections(self):
@@ -1181,11 +1453,19 @@ class MainWindow(QMainWindow):
         return True
 
     def restore_last_root_directory(self):
-        directory = str(QSettings().value("last_root_directory", "") or "")
+        settings = QSettings()
+        directory = str(settings.value("last_root_directory", "") or "")
+        if not directory:
+            legacy_settings = QSettings("ComSoc", LEGACY_SETTINGS_APPLICATION)
+            directory = str(
+                legacy_settings.value("last_root_directory", "") or ""
+            )
+            if directory:
+                settings.setValue("last_root_directory", directory)
+                settings.sync()
         if directory and os.path.isdir(directory):
             self.activate_root_directory(directory, show_errors=False)
         elif directory:
-            settings = QSettings()
             settings.remove("last_root_directory")
             settings.sync()
             self.lbl_dir_status.setText("A última pasta não existe mais. Selecione outra pasta.")
@@ -1196,6 +1476,7 @@ class MainWindow(QMainWindow):
         self.members_data = self.file_manager.scan_directory()
         self.refresh_filter_options()
         self.populate_gallery()
+        self.report_dashboard.refresh(self.members_data, self.config)
 
     def refresh_config_dependent_ui(self):
         self.import_rank_buttons.set_options(
