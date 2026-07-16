@@ -389,6 +389,7 @@ QFrame#gallery_selection_bar {
 
 QPushButton#danger_btn {
     background-color: #7f1d1d;
+    color: #ffffff;
     border-color: #a83232;
 }
 

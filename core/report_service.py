@@ -169,21 +169,39 @@ class ReportService:
         report = cls.build(members, config)
         view = context.get("view", "overview")
 
-        if view == "pending":
+        if view in {"general", "pending"}:
             selected_squadron = context.get("squadron", "Todos")
+            selected_statuses = set(
+                context.get("photo_statuses", ["Com foto", "Sem foto"])
+                if view == "general"
+                else ["Sem foto"]
+            )
             visible_members = [
                 member
-                for member in report["pendentes"]
+                for member in members
                 if selected_squadron in {"", "Todos"}
                 or member["esquadrao"] == selected_squadron
             ]
-            header = ["Posto/Graduação", "Nome de Guerra", "Esquadrão", "Fração"]
+            visible_members = [
+                member
+                for member in visible_members
+                if ("Com foto" if member.get("photo_count", 0) else "Sem foto")
+                in selected_statuses
+            ]
+            header = [
+                "Posto/Graduação",
+                "Nome de Guerra",
+                "Esquadrão",
+                "Fração",
+                "Fotos",
+            ]
             rows = [
                 [
                     member["posto_grad"],
                     member["nome_guerra"],
                     member["esquadrao"],
                     member["fracao"],
+                    member.get("photo_count", 0) or "Pendente",
                 ]
                 for member in visible_members
             ]
@@ -233,6 +251,8 @@ class ReportService:
 
     @staticmethod
     def export_filename(context: dict) -> str:
+        if context.get("view") == "general":
+            return "relatorio_geral.csv"
         if context.get("view") == "pending":
             return "pendencias_de_foto.csv"
         if context.get("view") == "matrix":

@@ -24,18 +24,20 @@ from PySide6.QtWidgets import (
 )
 
 from core.report_service import ReportService
+from ui.widgets.filter_button_grid import FilterButtonGrid
 
 
 class ReportDashboard(QWidget):
     TAB_OVERVIEW = 0
     TAB_MATRIX = 1
-    TAB_PENDING = 2
+    TAB_GENERAL = 2
     VIEW_SQUADRONS = "squadrons"
     VIEW_RANKS = "ranks"
     VIEW_SQUADRON_RANKS = "squadron_ranks"
 
     requestOpenMember = Signal(object)
     requestAddPhoto = Signal(object)
+    requestDeleteMember = Signal(object)
     requestExport = Signal(object)
 
     def __init__(self, parent=None):
@@ -59,7 +61,7 @@ class ReportDashboard(QWidget):
         self.report_tabs = QTabWidget(self)
         self.report_tabs.addTab(self._build_overview(), "Visão geral")
         self.report_tabs.addTab(self._build_matrix(), "Efetivo por posto")
-        self.report_tabs.addTab(self._build_pending(), "Pendências de foto")
+        self.report_tabs.addTab(self._build_general_report(), "Relatório Geral")
         layout.addWidget(self.report_tabs, 1)
 
     def _request_export(self):
@@ -67,10 +69,11 @@ class ReportDashboard(QWidget):
 
     def export_context(self) -> dict:
         current_tab = self.report_tabs.currentIndex()
-        if current_tab == self.TAB_PENDING:
+        if current_tab == self.TAB_GENERAL:
             return {
-                "view": "pending",
-                "squadron": self.pending_squadron.currentText(),
+                "view": "general",
+                "squadron": self.general_squadron.currentText(),
+                "photo_statuses": self.general_photo_filters.selected_values(),
             }
         if current_tab == self.TAB_MATRIX:
             return {"view": "matrix"}
@@ -136,27 +139,47 @@ class ReportDashboard(QWidget):
         layout.addWidget(self.matrix_table)
         return page
 
-    def _build_pending(self) -> QWidget:
+    def _build_general_report(self) -> QWidget:
         page = QWidget(self)
         layout = QVBoxLayout(page)
         filters = QHBoxLayout()
         filters.addWidget(QLabel("Esquadrão:", self))
-        self.pending_squadron = QComboBox(self)
-        self.pending_squadron.currentTextChanged.connect(self._populate_pending)
-        filters.addWidget(self.pending_squadron)
+        self.general_squadron = QComboBox(self)
+        self.general_squadron.currentTextChanged.connect(self._populate_general_report)
+        filters.addWidget(self.general_squadron)
+        filters.addSpacing(12)
+        filters.addWidget(QLabel("Situação da foto:", self))
+        self.general_photo_filters = FilterButtonGrid(
+            columns=2,
+            simple_toggle=True,
+            parent=self,
+        )
+        self.general_photo_filters.set_options(
+            ["Com foto", "Sem foto"],
+            all_mode=True,
+        )
+        self.general_photo_filters.selectionChanged.connect(
+            self._populate_general_report
+        )
+        filters.addWidget(self.general_photo_filters)
         filters.addStretch()
-        self.pending_count = QLabel("0 pendências", self)
-        filters.addWidget(self.pending_count)
+        self.general_count = QLabel("0 militares", self)
+        filters.addWidget(self.general_count)
         layout.addLayout(filters)
 
-        self.pending_table = QTableWidget(self)
-        self.pending_table.setColumnCount(5)
-        self.pending_table.setHorizontalHeaderLabels(
-            ["Posto/Graduação", "Nome", "Esquadrão", "Fração", "Ações"]
+        self.general_table = QTableWidget(self)
+        self.general_table.setColumnCount(6)
+        self.general_table.setHorizontalHeaderLabels(
+            ["Posto/Graduação", "Nome", "Esquadrão", "Fração", "Fotos", "Ações"]
         )
-        self.pending_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.pending_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        layout.addWidget(self.pending_table)
+        self.general_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.general_table.setAlternatingRowColors(True)
+        header = self.general_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.Fixed)
+        self.general_table.setColumnWidth(5, 290)
+        layout.addWidget(self.general_table)
         return page
 
     def refresh(self, members: list[dict], config: dict):
@@ -178,15 +201,15 @@ class ReportDashboard(QWidget):
         self._update_chart_controls()
         self._populate_chart()
         self._populate_matrix()
-        current = self.pending_squadron.currentText()
-        self.pending_squadron.blockSignals(True)
-        self.pending_squadron.clear()
-        self.pending_squadron.addItem("Todos")
-        self.pending_squadron.addItems(self.report["esquadroes"])
-        index = self.pending_squadron.findText(current)
-        self.pending_squadron.setCurrentIndex(index if index >= 0 else 0)
-        self.pending_squadron.blockSignals(False)
-        self._populate_pending()
+        current = self.general_squadron.currentText()
+        self.general_squadron.blockSignals(True)
+        self.general_squadron.clear()
+        self.general_squadron.addItem("Todos")
+        self.general_squadron.addItems(self.report["esquadroes"])
+        index = self.general_squadron.findText(current)
+        self.general_squadron.setCurrentIndex(index if index >= 0 else 0)
+        self.general_squadron.blockSignals(False)
+        self._populate_general_report()
 
     def _chart_selection_changed(self):
         self._update_chart_controls()
@@ -231,19 +254,32 @@ class ReportDashboard(QWidget):
             axis_labels = [rank_abbreviations.get(rank, rank) for rank in categories]
         photographed = QBarSet("Com foto")
         pending = QBarSet("Sem foto")
-        photographed.append([values_by_category[item]["com_foto"] for item in categories])
-        pending.append([values_by_category[item]["sem_foto"] for item in categories])
+        complete = QBarSet("Completo (100%)")
+        photographed_values = []
+        pending_values = []
+        complete_values = []
+        for item in categories:
+            values = values_by_category[item]
+            is_complete = values["total"] > 0 and values["sem_foto"] == 0
+            photographed_values.append(0 if is_complete else values["com_foto"])
+            pending_values.append(0 if is_complete else values["sem_foto"])
+            complete_values.append(values["total"] if is_complete else 0)
+        photographed.append(photographed_values)
+        pending.append(pending_values)
+        complete.append(complete_values)
         series = QStackedBarSeries()
         series.append(photographed)
         series.append(pending)
+        series.append(complete)
         series.setLabelsVisible(True)
         series.setLabelsFormat("@value")
         chart = QChart()
         chart.addSeries(series)
         chart.setTitle(title)
         chart.setTheme(QChart.ChartThemeDark)
-        photographed.setColor(QColor("#2eaf62"))
-        pending.setColor(QColor("#80868f"))
+        photographed.setColor(QColor("#3a86ff"))
+        pending.setColor(QColor("#FF5C00"))
+        complete.setColor(QColor("#2eaf62"))
         chart.legend().setVisible(True)
         chart.legend().setAlignment(Qt.AlignBottom)
         axis_x = QBarCategoryAxis()
@@ -295,36 +331,60 @@ class ReportDashboard(QWidget):
             )
         self.matrix_table.setItem(total_row, len(squadrons) + 1, QTableWidgetItem(str(self.report["total"])))
 
-    def _populate_pending(self):
-        selected = self.pending_squadron.currentText()
-        pending = [
+    def _populate_general_report(self):
+        selected_squadron = self.general_squadron.currentText()
+        selected_statuses = set(self.general_photo_filters.selected_values())
+        visible_members = [
             member
-            for member in self.report["pendentes"]
-            if selected in {"", "Todos"} or member["esquadrao"] == selected
+            for member in self.members
+            if (
+                selected_squadron in {"", "Todos"}
+                or member["esquadrao"] == selected_squadron
+            )
+            and (
+                "Com foto" if member.get("photo_count", 0) else "Sem foto"
+            )
+            in selected_statuses
         ]
-        self.pending_table.setRowCount(len(pending))
-        self.pending_count.setText(f"{len(pending)} pendência(s)")
-        for row, member in enumerate(pending):
+        self.general_table.setRowCount(len(visible_members))
+        count = len(visible_members)
+        self.general_count.setText(
+            "1 militar" if count == 1 else f"{count} militares"
+        )
+        for row, member in enumerate(visible_members):
+            photo_count = member.get("photo_count", 0)
             for column, value in enumerate(
                 [
                     member["posto_grad"],
                     member["nome_guerra"],
                     member["esquadrao"],
                     member["fracao"] or "—",
+                    photo_count if photo_count else "Pendente",
                 ]
             ):
-                self.pending_table.setItem(row, column, QTableWidgetItem(str(value)))
-            actions = QWidget(self.pending_table)
+                item = QTableWidgetItem(str(value))
+                if column == 4:
+                    item.setTextAlignment(Qt.AlignCenter)
+                self.general_table.setItem(row, column, item)
+            actions = QWidget(self.general_table)
             action_layout = QHBoxLayout(actions)
             action_layout.setContentsMargins(2, 2, 2, 2)
+            action_layout.setSpacing(4)
             open_button = QPushButton("Abrir", actions)
             add_button = QPushButton("Adicionar foto", actions)
+            delete_button = QPushButton("Excluir", actions)
+            delete_button.setObjectName("danger_btn")
             open_button.clicked.connect(
                 lambda checked=False, item=member: self.requestOpenMember.emit(item)
             )
             add_button.clicked.connect(
                 lambda checked=False, item=member: self.requestAddPhoto.emit(item)
             )
+            delete_button.clicked.connect(
+                lambda checked=False, item=member: self.requestDeleteMember.emit(item)
+            )
             action_layout.addWidget(open_button)
             action_layout.addWidget(add_button)
-            self.pending_table.setCellWidget(row, 4, actions)
+            action_layout.addWidget(delete_button)
+            self.general_table.setCellWidget(row, 5, actions)
+        self.general_table.resizeRowsToContents()

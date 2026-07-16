@@ -28,6 +28,7 @@ class MemberEditDialog(QDialog):
         self.structure = config.get("esquadroes", {})
         self.abbreviations = config.get("abreviacoes", {})
         self._initial_section = member["fracao"]
+        self.delete_requested = False
 
         self.setWindowTitle("Editar cadastro")
         self.setMinimumWidth(570)
@@ -74,10 +75,18 @@ class MemberEditDialog(QDialog):
         self._update_sections(self.squadron_buttons.currentText())
         layout.addStretch()
 
+        footer = QHBoxLayout()
+        delete_button = QPushButton("Excluir cadastro", self)
+        delete_button.setObjectName("danger_btn")
+        delete_button.clicked.connect(self._request_delete)
+        footer.addWidget(delete_button)
+        footer.addStretch()
+
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
         buttons.accepted.connect(self._accept_if_valid)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        footer.addWidget(buttons)
+        layout.addLayout(footer)
 
     @staticmethod
     def _label(text: str) -> QLabel:
@@ -112,6 +121,10 @@ class MemberEditDialog(QDialog):
             return
         self.accept()
 
+    def _request_delete(self):
+        self.delete_requested = True
+        self.reject()
+
     def values(self) -> tuple[str, str, str, str]:
         return (
             self.rank_buttons.currentText(),
@@ -126,6 +139,7 @@ class PhotoCard(QFrame):
     requestEdit = Signal(str, str, str, str, str)
     requestGallery = Signal(object)
     requestAddPhotos = Signal(object, object)
+    requestDelete = Signal(object)
 
     def __init__(self, member_data: dict, thumb_path: str, config: dict, parent=None):
         super().__init__(parent)
@@ -273,7 +287,10 @@ class PhotoCard(QFrame):
 
     def _edit_member(self):
         dialog = MemberEditDialog(self.data, self.config, self)
-        if dialog.exec() == QDialog.Accepted:
+        result = dialog.exec()
+        if dialog.delete_requested:
+            self.requestDelete.emit(self.data)
+        elif result == QDialog.Accepted:
             rank, name, squadron, section = dialog.values()
             original = (
                 self.data["posto_grad"],

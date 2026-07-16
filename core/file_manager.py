@@ -715,6 +715,35 @@ class FileManager:
         if not remaining and os.path.isdir(member_path):
             self._ensure_member_marker(member_path)
 
+    def delete_member(self, member_path: str) -> None:
+        """Exclui permanentemente um cadastro moderno ou uma foto legada."""
+        self._require_root()
+        member_path = os.path.abspath(member_path)
+        root = os.path.abspath(self.root_path)
+        if (
+            member_path == root
+            or os.path.commonpath([root, member_path]) != root
+        ):
+            raise ValueError("O cadastro informado não pertence à pasta raiz.")
+        if not os.path.exists(member_path):
+            raise FileNotFoundError("O cadastro não existe mais.")
+        if not (os.path.isdir(member_path) or os.path.isfile(member_path)):
+            raise ValueError("O caminho informado não é um cadastro válido.")
+
+        parent = os.path.dirname(member_path)
+        staged_path = os.path.join(parent, f".delete-{uuid.uuid4().hex}")
+        shutil.move(member_path, staged_path)
+        try:
+            if os.path.isdir(staged_path):
+                shutil.rmtree(staged_path)
+            else:
+                os.remove(staged_path)
+        except Exception:
+            if os.path.exists(staged_path) and not os.path.exists(member_path):
+                shutil.move(staged_path, member_path)
+            raise
+        self._cleanup_empty_dirs(parent)
+
     def _delete_with_staging(self, files: List[tuple[str, str]]) -> None:
         parent = os.path.dirname(files[0][0])
         stage_dir = os.path.join(parent, f".delete-{uuid.uuid4().hex}")

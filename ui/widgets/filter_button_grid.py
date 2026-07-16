@@ -22,12 +22,14 @@ class FilterButtonGrid(QWidget):
         columns: int = 3,
         label_formatter: Callable[[str], str] | None = None,
         empty_text: str = "Nenhuma opção disponível",
+        simple_toggle: bool = False,
         parent=None,
     ):
         super().__init__(parent)
         self.columns = max(1, columns)
         self.label_formatter = label_formatter or (lambda value: value)
         self.empty_text = empty_text
+        self.simple_toggle = simple_toggle
         self._values: list[str] = []
         self._buttons: dict[str, QPushButton] = {}
         self._all_mode = False
@@ -94,6 +96,10 @@ class FilterButtonGrid(QWidget):
         return len(self._buttons)
 
     def _button_clicked(self, value: str) -> None:
+        if self.simple_toggle:
+            self._all_mode = self.all_selected()
+            self.selectionChanged.emit()
+            return
         # Quando 'todos' estava ativo, um clique passa a significar 'somente este'.
         if self._all_mode:
             for item, button in self._buttons.items():

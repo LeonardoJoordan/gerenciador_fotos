@@ -761,6 +761,7 @@ class MainWindow(QMainWindow):
             card.requestEdit.connect(self.handle_member_edit)
             card.requestGallery.connect(self.open_member_gallery)
             card.requestAddPhotos.connect(self.handle_card_add_photos)
+            card.requestDelete.connect(self.handle_member_delete)
             self.flow_layout.addWidget(card)
             if member["absolute_path"] and not thumb_path:
                 self._queue_thumbnail(member["absolute_path"], 150, card)
@@ -845,6 +846,9 @@ class MainWindow(QMainWindow):
         self.report_dashboard = ReportDashboard(self)
         self.report_dashboard.requestOpenMember.connect(self.open_member_gallery)
         self.report_dashboard.requestAddPhoto.connect(self.handle_report_add_photo)
+        self.report_dashboard.requestDeleteMember.connect(
+            self.handle_member_delete
+        )
         self.report_dashboard.requestExport.connect(self.export_reports)
         return self.report_dashboard
 
@@ -854,6 +858,46 @@ class MainWindow(QMainWindow):
         )
         if paths:
             self.handle_card_add_photos(member, paths)
+
+    def handle_member_delete(self, member: dict):
+        photo_count = member.get("photo_count", 0)
+        identity = f"{member['posto_grad']} {member['nome_guerra']}"
+        if photo_count == 1:
+            details = (
+                f"O cadastro de {identity} e sua foto serão excluídos "
+                "permanentemente."
+            )
+        elif photo_count > 1:
+            details = (
+                f"O cadastro de {identity} e suas {photo_count} fotos serão "
+                "excluídos permanentemente."
+            )
+        else:
+            details = f"O cadastro sem foto de {identity} será excluído permanentemente."
+        answer = QMessageBox.question(
+            self,
+            "Confirmar exclusão",
+            f"{details}\n\nEsta ação não pode ser desfeita. Deseja continuar?",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            for photo in member.get("photos", []):
+                self.image_processor.invalidate_thumbnail(
+                    self.root_directory, photo
+                )
+            self.file_manager.delete_member(member["member_path"])
+            self.reload_data()
+            QMessageBox.information(
+                self,
+                "Cadastro excluído",
+                f"O cadastro de {identity} foi excluído.",
+            )
+        except Exception as exc:
+            self._show_error("Erro ao excluir cadastro", exc)
+            self.reload_data()
 
     def export_reports(self, context: dict):
         suggested_filename = ReportService.export_filename(context)
