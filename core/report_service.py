@@ -7,9 +7,41 @@ from typing import Any
 class ReportService:
     """Agrega o efetivo e exporta relatórios sem manter estado paralelo."""
 
+    STATUS_CURRENT = "Em dia"
+    STATUS_PENDING = "Pendente"
+    STATUS_UPDATE = "Atualizar"
+    PHOTO_STATUSES = (STATUS_CURRENT, STATUS_PENDING, STATUS_UPDATE)
+
     @staticmethod
     def ordered_values(configured, actual) -> list[str]:
         return list(dict.fromkeys([*configured, *actual]))
+
+    @classmethod
+    def member_status(cls, member: dict) -> str:
+        if member.get("photo_count", 0) == 0:
+            return cls.STATUS_PENDING
+        if member.get("update_recommended", False):
+            return cls.STATUS_UPDATE
+        return cls.STATUS_CURRENT
+
+    @classmethod
+    def _aggregate_statuses(cls, members: list[dict]) -> dict[str, Any]:
+        counts = Counter(cls.member_status(member) for member in members)
+        total = len(members)
+        current = counts[cls.STATUS_CURRENT]
+        pending = counts[cls.STATUS_PENDING]
+        update = counts[cls.STATUS_UPDATE]
+        return {
+            "total": total,
+            "em_dia": current,
+            "pendente": pending,
+            "atualizar": update,
+            "regularidade": (current / total * 100) if total else 0.0,
+            # Chaves mantidas para compatibilidade com exportações antigas.
+            "com_foto": current + update,
+            "sem_foto": pending,
+            "cobertura": (current / total * 100) if total else 0.0,
+        }
 
     @classmethod
     def build(cls, members: list[dict], config: dict) -> dict[str, Any]:
@@ -21,32 +53,18 @@ class ReportService:
             config.get("postos_graduacoes", []),
             (member["posto_grad"] for member in members),
         )
-        with_photo = sum(member.get("photo_count", 0) > 0 for member in members)
-        without_photo = len(members) - with_photo
+        totals = cls._aggregate_statuses(members)
 
         by_squadron = {}
         for squadron in squadrons:
             squad_members = [m for m in members if m["esquadrao"] == squadron]
-            photographed = sum(m.get("photo_count", 0) > 0 for m in squad_members)
-            total = len(squad_members)
-            by_squadron[squadron] = {
-                "total": total,
-                "com_foto": photographed,
-                "sem_foto": total - photographed,
-                "cobertura": (photographed / total * 100) if total else 0.0,
-            }
+            by_squadron[squadron] = cls._aggregate_statuses(squad_members)
 
         by_rank = {}
         by_squadron_rank = {}
         for rank in ranks:
             rank_members = [m for m in members if m["posto_grad"] == rank]
-            photographed = sum(m.get("photo_count", 0) > 0 for m in rank_members)
-            total = len(rank_members)
-            by_rank[rank] = {
-                "total": total,
-                "com_foto": photographed,
-                "sem_foto": total - photographed,
-            }
+            by_rank[rank] = cls._aggregate_statuses(rank_members)
 
         for squadron in squadrons:
             by_squadron_rank[squadron] = {}
@@ -57,15 +75,9 @@ class ReportService:
                     if member["esquadrao"] == squadron
                     and member["posto_grad"] == rank
                 ]
-                photographed = sum(
-                    member.get("photo_count", 0) > 0 for member in rank_members
+                by_squadron_rank[squadron][rank] = cls._aggregate_statuses(
+                    rank_members
                 )
-                total = len(rank_members)
-                by_squadron_rank[squadron][rank] = {
-                    "total": total,
-                    "com_foto": photographed,
-                    "sem_foto": total - photographed,
-                }
 
         counts = Counter(
             (member["posto_grad"], member["esquadrao"]) for member in members
@@ -74,12 +86,13 @@ class ReportService:
             rank: {squadron: counts[(rank, squadron)] for squadron in squadrons}
             for rank in ranks
         }
-        pending = [member for member in members if member.get("photo_count", 0) == 0]
+        pending = [
+            member
+            for member in members
+            if cls.member_status(member) == cls.STATUS_PENDING
+        ]
         return {
-            "total": len(members),
-            "com_foto": with_photo,
-            "sem_foto": without_photo,
-            "cobertura": (with_photo / len(members) * 100) if members else 0.0,
+            **totals,
             "esquadroes": squadrons,
             "postos": ranks,
             "por_esquadrao": by_squadron,
@@ -99,9 +112,10 @@ class ReportService:
             [
                 squadron,
                 values["total"],
-                values["com_foto"],
-                values["sem_foto"],
-                f'{values["cobertura"]:.1f}',
+                values["em_dia"],
+                values["pendente"],
+                values["atualizar"],
+                f'{values["regularidade"]:.1f}',
             ]
             for squadron, values in report["por_esquadrao"].items()
         ]
@@ -109,7 +123,14 @@ class ReportService:
             cls._write_csv(
                 directory,
                 "efetivo_por_esquadrao.csv",
-                ["Esquadrão", "Total", "Com foto", "Sem foto", "Cobertura (%)"],
+                [
+                    "Esquadrão",
+                    "Total",
+                    "Em dia",
+                    "Pendente",
+                    "Atualizar",
+                    "Regularidade (%)",
+                ],
                 squad_rows,
             )
         )
@@ -140,7 +161,7 @@ class ReportService:
                 member["nome_guerra"],
                 member["esquadrao"],
                 member["fracao"],
-                "Com foto" if member.get("photo_count", 0) else "Sem foto",
+                cls.member_status(member),
                 member.get("photo_count", 0),
                 member["member_path"],
             ]
@@ -149,7 +170,11 @@ class ReportService:
         written.append(
             cls._write_csv(directory, "relacao_completa.csv", detail_header, detail_rows)
         )
-        pending_rows = [row for member, row in zip(members, detail_rows) if not member.get("photo_count", 0)]
+        pending_rows = [
+            row
+            for member, row in zip(members, detail_rows)
+            if cls.member_status(member) == cls.STATUS_PENDING
+        ]
         written.append(
             cls._write_csv(directory, "pendencias_de_foto.csv", detail_header, pending_rows)
         )
@@ -172,9 +197,9 @@ class ReportService:
         if view in {"general", "pending"}:
             selected_squadron = context.get("squadron", "Todos")
             selected_statuses = set(
-                context.get("photo_statuses", ["Com foto", "Sem foto"])
+                context.get("photo_statuses", cls.PHOTO_STATUSES)
                 if view == "general"
-                else ["Sem foto"]
+                else [cls.STATUS_PENDING]
             )
             visible_members = [
                 member
@@ -185,8 +210,7 @@ class ReportService:
             visible_members = [
                 member
                 for member in visible_members
-                if ("Com foto" if member.get("photo_count", 0) else "Sem foto")
-                in selected_statuses
+                if cls.member_status(member) in selected_statuses
             ]
             header = [
                 "Posto/Graduação",
@@ -194,6 +218,7 @@ class ReportService:
                 "Esquadrão",
                 "Fração",
                 "Fotos",
+                "Status",
             ]
             rows = [
                 [
@@ -201,7 +226,8 @@ class ReportService:
                     member["nome_guerra"],
                     member["esquadrao"],
                     member["fracao"],
-                    member.get("photo_count", 0) or "Pendente",
+                    member.get("photo_count", 0),
+                    cls.member_status(member),
                 ]
                 for member in visible_members
             ]
@@ -266,25 +292,34 @@ class ReportService:
 
     @staticmethod
     def _status_rows(label: str, categories: list[str], values: dict) -> tuple[list, list]:
-        header = [label, "Total", "Com foto", "Sem foto", "Cobertura (%)"]
+        header = [
+            label,
+            "Total",
+            "Em dia",
+            "Pendente",
+            "Atualizar",
+            "Regularidade (%)",
+        ]
         rows = []
         for category in categories:
             category_values = values.get(
-                category, {"total": 0, "com_foto": 0, "sem_foto": 0}
-            )
-            total = category_values["total"]
-            coverage = (
-                category_values.get("cobertura")
-                if "cobertura" in category_values
-                else (category_values["com_foto"] / total * 100 if total else 0.0)
+                category,
+                {
+                    "total": 0,
+                    "em_dia": 0,
+                    "pendente": 0,
+                    "atualizar": 0,
+                    "regularidade": 0.0,
+                },
             )
             rows.append(
                 [
                     category,
-                    total,
-                    category_values["com_foto"],
-                    category_values["sem_foto"],
-                    f"{coverage:.1f}",
+                    category_values["total"],
+                    category_values["em_dia"],
+                    category_values["pendente"],
+                    category_values["atualizar"],
+                    f'{category_values["regularidade"]:.1f}',
                 ]
             )
         return header, rows

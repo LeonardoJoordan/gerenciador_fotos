@@ -140,6 +140,7 @@ class PhotoCard(QFrame):
     requestGallery = Signal(object)
     requestAddPhotos = Signal(object, object)
     requestDelete = Signal(object)
+    requestPhotoUpdate = Signal(object, bool)
 
     def __init__(self, member_data: dict, thumb_path: str, config: dict, parent=None):
         super().__init__(parent)
@@ -150,7 +151,7 @@ class PhotoCard(QFrame):
         self.setObjectName("photo_card")
         self.setProperty("withoutPhoto", self.data.get("photo_count", 0) == 0)
         self.setAcceptDrops(True)
-        self.setFixedSize(200, 350)
+        self.setFixedSize(200, 375)
         self.init_ui()
 
     def init_ui(self):
@@ -217,6 +218,25 @@ class PhotoCard(QFrame):
         edit_button.clicked.connect(self._edit_member)
 
         count = self.data.get("photo_count", 0)
+        update_toggle = QPushButton("", self)
+        update_toggle.setObjectName("photo_update_toggle")
+        update_toggle.setCheckable(True)
+        update_toggle.setChecked(
+            count > 0 and self.data.get("update_recommended", False)
+        )
+        update_toggle.setEnabled(count > 0)
+        update_toggle.setFixedSize(28, 26)
+        update_toggle.setCursor(Qt.PointingHandCursor)
+        update_toggle.setAccessibleName("Marcar para atualizar foto")
+        update_toggle.setToolTip(
+            "Marcar como “Atualizar”: indica que este militar deve renovar a foto."
+            if count > 0
+            else "Cadastros sem foto já possuem o status “Pendente”."
+        )
+        update_toggle.clicked.connect(
+            lambda checked: self.requestPhotoUpdate.emit(self.data, checked)
+        )
+
         photo_count = QLabel(
             "Sem fotos" if count == 0 else f"{count} foto(s)", self
         )
@@ -232,6 +252,7 @@ class PhotoCard(QFrame):
 
         layout.addWidget(self.img_label, 0, Qt.AlignHCenter)
         layout.addWidget(self.name_label)
+        layout.addWidget(update_toggle, 0, Qt.AlignHCenter)
         layout.addWidget(photo_count)
         layout.addLayout(tags_layout)
         layout.addLayout(actions)

@@ -88,9 +88,10 @@ class ReportDashboard(QWidget):
         layout = QVBoxLayout(page)
         cards = QGridLayout()
         self.total_value = self._metric_card(cards, 0, "Efetivo total")
-        self.with_photo_value = self._metric_card(cards, 1, "Com foto")
-        self.without_photo_value = self._metric_card(cards, 2, "Sem foto")
-        self.coverage_value = self._metric_card(cards, 3, "Cobertura")
+        self.current_value = self._metric_card(cards, 1, "Em dia")
+        self.pending_value = self._metric_card(cards, 2, "Pendente")
+        self.update_value = self._metric_card(cards, 3, "Atualizar")
+        self.regularity_value = self._metric_card(cards, 4, "Regularidade")
         layout.addLayout(cards)
 
         chart_filters = QHBoxLayout()
@@ -150,12 +151,12 @@ class ReportDashboard(QWidget):
         filters.addSpacing(12)
         filters.addWidget(QLabel("Situação da foto:", self))
         self.general_photo_filters = FilterButtonGrid(
-            columns=2,
+            columns=3,
             simple_toggle=True,
             parent=self,
         )
         self.general_photo_filters.set_options(
-            ["Com foto", "Sem foto"],
+            ReportService.PHOTO_STATUSES,
             all_mode=True,
         )
         self.general_photo_filters.selectionChanged.connect(
@@ -168,17 +169,25 @@ class ReportDashboard(QWidget):
         layout.addLayout(filters)
 
         self.general_table = QTableWidget(self)
-        self.general_table.setColumnCount(6)
+        self.general_table.setColumnCount(7)
         self.general_table.setHorizontalHeaderLabels(
-            ["Posto/Graduação", "Nome", "Esquadrão", "Fração", "Fotos", "Ações"]
+            [
+                "Posto/Graduação",
+                "Nome",
+                "Esquadrão",
+                "Fração",
+                "Fotos",
+                "Status",
+                "Ações",
+            ]
         )
         self.general_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.general_table.setAlternatingRowColors(True)
         header = self.general_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(5, QHeaderView.Fixed)
-        self.general_table.setColumnWidth(5, 290)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
+        self.general_table.setColumnWidth(6, 290)
         layout.addWidget(self.general_table)
         return page
 
@@ -187,9 +196,10 @@ class ReportDashboard(QWidget):
         self.config = config
         self.report = ReportService.build(self.members, config)
         self.total_value.setText(str(self.report["total"]))
-        self.with_photo_value.setText(str(self.report["com_foto"]))
-        self.without_photo_value.setText(str(self.report["sem_foto"]))
-        self.coverage_value.setText(f'{self.report["cobertura"]:.1f}%')
+        self.current_value.setText(str(self.report["em_dia"]))
+        self.pending_value.setText(str(self.report["pendente"]))
+        self.update_value.setText(str(self.report["atualizar"]))
+        self.regularity_value.setText(f'{self.report["regularidade"]:.1f}%')
 
         selected_squadron = self.chart_squadron.currentText()
         self.chart_squadron.blockSignals(True)
@@ -252,23 +262,32 @@ class ReportDashboard(QWidget):
                 "postos_graduacoes", {}
             )
             axis_labels = [rank_abbreviations.get(rank, rank) for rank in categories]
-        photographed = QBarSet("Com foto")
-        pending = QBarSet("Sem foto")
+        current = QBarSet("Em dia")
+        pending = QBarSet("Pendente")
+        update = QBarSet("Atualizar")
         complete = QBarSet("Completo (100%)")
-        photographed_values = []
+        current_values = []
         pending_values = []
+        update_values = []
         complete_values = []
         for item in categories:
             values = values_by_category[item]
-            is_complete = values["total"] > 0 and values["sem_foto"] == 0
-            photographed_values.append(0 if is_complete else values["com_foto"])
-            pending_values.append(0 if is_complete else values["sem_foto"])
+            is_complete = (
+                values["total"] > 0
+                and values["pendente"] == 0
+                and values["atualizar"] == 0
+            )
+            current_values.append(0 if is_complete else values["em_dia"])
+            pending_values.append(0 if is_complete else values["pendente"])
+            update_values.append(0 if is_complete else values["atualizar"])
             complete_values.append(values["total"] if is_complete else 0)
-        photographed.append(photographed_values)
+        current.append(current_values)
         pending.append(pending_values)
+        update.append(update_values)
         complete.append(complete_values)
         series = QStackedBarSeries()
-        series.append(photographed)
+        series.append(current)
+        series.append(update)
         series.append(pending)
         series.append(complete)
         series.setLabelsVisible(True)
@@ -277,8 +296,9 @@ class ReportDashboard(QWidget):
         chart.addSeries(series)
         chart.setTitle(title)
         chart.setTheme(QChart.ChartThemeDark)
-        photographed.setColor(QColor("#3a86ff"))
+        current.setColor(QColor("#3a86ff"))
         pending.setColor(QColor("#FF5C00"))
+        update.setColor(QColor("#A78BFA"))
         complete.setColor(QColor("#2eaf62"))
         chart.legend().setVisible(True)
         chart.legend().setAlignment(Qt.AlignBottom)
@@ -341,11 +361,9 @@ class ReportDashboard(QWidget):
                 selected_squadron in {"", "Todos"}
                 or member["esquadrao"] == selected_squadron
             )
-            and (
-                "Com foto" if member.get("photo_count", 0) else "Sem foto"
-            )
-            in selected_statuses
+            and ReportService.member_status(member) in selected_statuses
         ]
+        self.general_table.setRowCount(0)
         self.general_table.setRowCount(len(visible_members))
         count = len(visible_members)
         self.general_count.setText(
@@ -359,13 +377,26 @@ class ReportDashboard(QWidget):
                     member["nome_guerra"],
                     member["esquadrao"],
                     member["fracao"] or "—",
-                    photo_count if photo_count else "Pendente",
+                    photo_count,
                 ]
             ):
                 item = QTableWidgetItem(str(value))
                 if column == 4:
                     item.setTextAlignment(Qt.AlignCenter)
                 self.general_table.setItem(row, column, item)
+            status = ReportService.member_status(member)
+            status_label = QLabel(status, self.general_table)
+            status_label.setObjectName("report_status")
+            status_label.setProperty(
+                "photoStatus",
+                {
+                    ReportService.STATUS_CURRENT: "current",
+                    ReportService.STATUS_PENDING: "pending",
+                    ReportService.STATUS_UPDATE: "update",
+                }[status],
+            )
+            status_label.setAlignment(Qt.AlignCenter)
+            self.general_table.setCellWidget(row, 5, status_label)
             actions = QWidget(self.general_table)
             action_layout = QHBoxLayout(actions)
             action_layout.setContentsMargins(2, 2, 2, 2)
@@ -386,5 +417,5 @@ class ReportDashboard(QWidget):
             action_layout.addWidget(open_button)
             action_layout.addWidget(add_button)
             action_layout.addWidget(delete_button)
-            self.general_table.setCellWidget(row, 5, actions)
+            self.general_table.setCellWidget(row, 6, actions)
         self.general_table.resizeRowsToContents()

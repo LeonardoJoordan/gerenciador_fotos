@@ -222,6 +222,34 @@ QPushButton#card_edit_btn {
     font-weight: normal;
 }
 
+QPushButton#photo_update_toggle {
+    background-color: #252525;
+    color: #747b85;
+    border: 1px solid #3b3b3b;
+    border-radius: 5px;
+    padding: 1px;
+    font-size: 17px;
+    font-weight: bold;
+}
+
+QPushButton#photo_update_toggle:hover {
+    background-color: #303030;
+    color: #aeb4be;
+    border-color: #575d66;
+}
+
+QPushButton#photo_update_toggle:checked {
+    background-color: #49200d;
+    color: #FF5C00;
+    border-color: #FF5C00;
+}
+
+QPushButton#photo_update_toggle:disabled {
+    background-color: #202020;
+    color: #454545;
+    border-color: #2b2b2b;
+}
+
 QPushButton#gallery_action_btn {
     padding: 6px 3px;
     font-size: 11px;
@@ -338,6 +366,28 @@ QFrame#report_metric_card {
     border: 1px solid #343434;
     border-radius: 8px;
     min-height: 92px;
+}
+
+QLabel#report_status {
+    margin: 4px 8px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-weight: bold;
+}
+
+QLabel#report_status[photoStatus="current"] {
+    color: #79b0ff;
+    background-color: #1b2b43;
+}
+
+QLabel#report_status[photoStatus="pending"] {
+    color: #FF7A33;
+    background-color: #49200d;
+}
+
+QLabel#report_status[photoStatus="update"] {
+    color: #A78BFA;
+    background-color: #2e2548;
 }
 
 QLabel#report_metric_title {

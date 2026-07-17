@@ -762,6 +762,7 @@ class MainWindow(QMainWindow):
             card.requestGallery.connect(self.open_member_gallery)
             card.requestAddPhotos.connect(self.handle_card_add_photos)
             card.requestDelete.connect(self.handle_member_delete)
+            card.requestPhotoUpdate.connect(self.handle_photo_update_recommended)
             self.flow_layout.addWidget(card)
             if member["absolute_path"] and not thumb_path:
                 self._queue_thumbnail(member["absolute_path"], 150, card)
@@ -801,6 +802,16 @@ class MainWindow(QMainWindow):
             self.reload_data()
         except Exception as exc:
             self._show_error("Erro ao editar cadastro", exc)
+            self.reload_data()
+
+    def handle_photo_update_recommended(self, member: dict, recommended: bool):
+        try:
+            self.file_manager.set_photo_update_recommended(
+                member["member_path"], recommended
+            )
+            self.reload_data()
+        except Exception as exc:
+            self._show_error("Erro ao atualizar situação da foto", exc)
             self.reload_data()
 
     def open_member_gallery(self, member: dict):

@@ -98,6 +98,7 @@ class FileManager:
     VALID_EXTENSIONS = _supported_photo_extensions()
     CONFIG_FILENAME = "config.json"
     MEMBER_MARKER = ".cadastro"
+    PHOTO_UPDATE_MARKER = ".atualizar-foto"
 
     def __init__(self, root_path: str = ""):
         self.root_path = os.path.abspath(root_path) if root_path else ""
@@ -368,6 +369,9 @@ class FileManager:
                         "photo_count": 1,
                         "has_photo": True,
                         "is_legacy": True,
+                        "update_recommended": os.path.isfile(
+                            self._photo_update_marker_path(item["absolute_path"])
+                        ),
                     })
                     items.append(item)
 
@@ -435,6 +439,9 @@ class FileManager:
             "photo_count": 0,
             "has_photo": False,
             "is_legacy": False,
+            "update_recommended": os.path.isfile(
+                self._photo_update_marker_path(member_path)
+            ),
             "esquadrao": esquadrao,
             "fracao": fracao,
             "posto_grad": posto_grad,
@@ -512,7 +519,7 @@ class FileManager:
         if os.path.abspath(current_path) == os.path.abspath(destination):
             return destination
         self._ensure_destination_available(destination)
-        shutil.move(current_path, destination)
+        self._move_member_with_marker(current_path, destination)
         self._cleanup_empty_dirs(os.path.dirname(current_path))
         return destination
 
@@ -589,6 +596,9 @@ class FileManager:
             for source, destination in zip(source_paths, destinations):
                 shutil.copy2(source, destination)
                 copied.append(destination)
+            update_marker = self._photo_update_marker_path(member_path)
+            if os.path.isfile(update_marker):
+                os.remove(update_marker)
         except Exception:
             for destination in copied:
                 if os.path.isfile(destination):
@@ -608,14 +618,53 @@ class FileManager:
         destination = os.path.join(
             member_dir, f"{identity}_01{Path(current_path).suffix.lower()}"
         )
+        legacy_marker = self._photo_update_marker_path(current_path)
+        update_recommended = os.path.isfile(legacy_marker)
         try:
             shutil.move(current_path, destination)
             self._ensure_member_marker(member_dir)
+            if update_recommended:
+                shutil.move(
+                    legacy_marker,
+                    self._photo_update_marker_path(member_dir),
+                )
         except Exception:
+            modern_update_marker = self._photo_update_marker_path(member_dir)
+            if (
+                update_recommended
+                and os.path.isfile(modern_update_marker)
+                and not os.path.exists(legacy_marker)
+            ):
+                shutil.move(modern_update_marker, legacy_marker)
+            if os.path.isfile(destination) and not os.path.isfile(current_path):
+                shutil.move(destination, current_path)
+            member_marker = os.path.join(member_dir, self.MEMBER_MARKER)
+            if os.path.isfile(member_marker):
+                os.remove(member_marker)
             if os.path.isdir(member_dir) and not os.listdir(member_dir):
                 os.rmdir(member_dir)
             raise
         return member_dir
+
+    def set_photo_update_recommended(
+        self, member_path: str, recommended: bool
+    ) -> None:
+        """Marca ou desmarca um cadastro que precisa renovar sua fotografia."""
+        self._require_root()
+        member_path = os.path.abspath(member_path)
+        root = os.path.abspath(self.root_path)
+        if os.path.commonpath([root, member_path]) != root:
+            raise ValueError("O cadastro informado não pertence à pasta raiz.")
+        if not os.path.exists(member_path):
+            raise FileNotFoundError("O cadastro não existe mais.")
+        if recommended and not self._member_has_photos(member_path):
+            raise ValueError("Cadastros sem foto já possuem o status Pendente.")
+
+        marker_path = self._photo_update_marker_path(member_path)
+        if recommended:
+            Path(marker_path).touch(exist_ok=True)
+        elif os.path.isfile(marker_path):
+            os.remove(marker_path)
 
     def set_primary_photo(self, member_path: str, selected_path: str) -> str:
         self._require_root()
@@ -663,7 +712,11 @@ class FileManager:
         if os.path.isfile(member_path):
             if selected != [member_path]:
                 raise ValueError("A seleção não pertence ao cadastro informado.")
-            self._delete_with_staging([(member_path, os.path.basename(member_path))])
+            files = [(member_path, os.path.basename(member_path))]
+            marker_path = self._photo_update_marker_path(member_path)
+            if os.path.isfile(marker_path):
+                files.append((marker_path, os.path.basename(marker_path)))
+            self._delete_with_staging(files)
             return
         if not os.path.isdir(member_path):
             raise FileNotFoundError("O cadastro não existe mais.")
@@ -713,6 +766,9 @@ class FileManager:
 
         shutil.rmtree(stage_dir)
         if not remaining and os.path.isdir(member_path):
+            marker_path = self._photo_update_marker_path(member_path)
+            if os.path.isfile(marker_path):
+                os.remove(marker_path)
             self._ensure_member_marker(member_path)
 
     def delete_member(self, member_path: str) -> None:
@@ -731,6 +787,15 @@ class FileManager:
             raise ValueError("O caminho informado não é um cadastro válido.")
 
         parent = os.path.dirname(member_path)
+        if os.path.isfile(member_path):
+            files = [(member_path, os.path.basename(member_path))]
+            marker_path = self._photo_update_marker_path(member_path)
+            if os.path.isfile(marker_path):
+                files.append((marker_path, os.path.basename(marker_path)))
+            self._delete_with_staging(files)
+            self._cleanup_empty_dirs(parent)
+            return
+
         staged_path = os.path.join(parent, f".delete-{uuid.uuid4().hex}")
         shutil.move(member_path, staged_path)
         try:
@@ -773,7 +838,7 @@ class FileManager:
         if os.path.abspath(current_path) == os.path.abspath(destination):
             return destination
         self._ensure_destination_available(destination)
-        os.rename(current_path, destination)
+        self._move_member_with_marker(current_path, destination)
         return destination
 
     def update_member(
@@ -807,7 +872,7 @@ class FileManager:
             return destination
         self._ensure_destination_available(destination)
         os.makedirs(destination_dir, exist_ok=True)
-        shutil.move(current_path, destination)
+        self._move_member_with_marker(current_path, destination)
         self._cleanup_empty_dirs(os.path.dirname(current_path))
         return destination
 
@@ -915,6 +980,38 @@ class FileManager:
     def _ensure_member_marker(cls, member_path: str) -> None:
         marker_path = os.path.join(member_path, cls.MEMBER_MARKER)
         Path(marker_path).touch(exist_ok=True)
+
+    @classmethod
+    def _photo_update_marker_path(cls, member_path: str) -> str:
+        if os.path.isdir(member_path):
+            return os.path.join(member_path, cls.PHOTO_UPDATE_MARKER)
+        return f"{member_path}{cls.PHOTO_UPDATE_MARKER}"
+
+    def _member_has_photos(self, member_path: str) -> bool:
+        if os.path.isfile(member_path):
+            return Path(member_path).suffix.lower() in self.VALID_EXTENSIONS
+        if not os.path.isdir(member_path):
+            return False
+        return any(
+            Path(name).suffix.lower() in self.VALID_EXTENSIONS
+            for name in os.listdir(member_path)
+        )
+
+    def _move_member_with_marker(self, source: str, destination: str) -> None:
+        """Move cadastro e marcador lateral legado como uma única operação."""
+        source_marker = self._photo_update_marker_path(source)
+        has_sidecar = os.path.isfile(source) and os.path.isfile(source_marker)
+        destination_marker = f"{destination}{self.PHOTO_UPDATE_MARKER}"
+        if has_sidecar:
+            self._ensure_destination_available(destination_marker)
+        shutil.move(source, destination)
+        try:
+            if has_sidecar:
+                shutil.move(source_marker, destination_marker)
+        except Exception:
+            if os.path.exists(destination) and not os.path.exists(source):
+                shutil.move(destination, source)
+            raise
 
     @staticmethod
     def _ensure_destination_available(destination: str) -> None:
