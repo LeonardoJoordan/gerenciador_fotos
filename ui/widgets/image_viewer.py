@@ -255,9 +255,12 @@ class ImageViewerDialog(QDialog):
         self.setWindowTitle(os.path.basename(self.current_path))
         self._show_thumbnail()
         if request_image:
-            self._request_image(full_resolution=False)
+            self._request_image(
+                full_resolution=True,
+                full_behavior="fit",
+            )
         else:
-            self.status_label.setText("Carregando imagem...")
+            self.status_label.setText("Carregando imagem original...")
 
     def _show_thumbnail(self):
         thumbnail = QPixmap(self.thumbnail_paths.get(self.current_path, ""))
@@ -464,7 +467,10 @@ class ImageViewerDialog(QDialog):
 
         if self._initial_load_pending:
             self._initial_load_pending = False
-            self._request_image(full_resolution=False)
+            self._request_image(
+                full_resolution=True,
+                full_behavior="fit",
+            )
 
     def closeEvent(self, event: QEvent):
         self._active_request = -1
