@@ -849,7 +849,11 @@ class MainWindow(QMainWindow):
         filters.addLayout(
             self._filter_header("Situação da foto", self.btn_all_photo_status)
         )
-        self.filter_photo_buttons = FilterButtonGrid(columns=2, parent=self)
+        self.filter_photo_buttons = FilterButtonGrid(
+            columns=3,
+            simple_toggle=True,
+            parent=self,
+        )
         filters.addWidget(self.filter_photo_buttons)
 
         self.search_input = QLineEdit(self)
@@ -964,7 +968,7 @@ class MainWindow(QMainWindow):
         configured_ranks = self.config.get("postos_graduacoes", [])
         configured_squadrons = self.config.get("esquadroes", {}).keys()
         self.filter_photo_buttons.set_options(
-            ["Com foto", "Sem foto"],
+            ReportService.PHOTO_STATUSES,
             photo_selection,
             all_mode=photo_all or first_photo_load,
         )
@@ -1153,7 +1157,7 @@ class MainWindow(QMainWindow):
                 if not self._member_is_unrecognized(member):
                     continue
             else:
-                member_status = "Com foto" if member.get("photo_count", 0) else "Sem foto"
+                member_status = ReportService.member_status(member)
                 if member_status not in photo_statuses:
                     continue
                 if not ranks or member["posto_grad"] not in ranks:
@@ -1388,6 +1392,7 @@ class MainWindow(QMainWindow):
         if card:
             card.set_update_recommended(recommended)
         self._mark_reports_dirty()
+        self._schedule_gallery_refresh()
 
         def operation(file_manager: FileManager, image_processor: ImageProcessor, root_directory: str):
             file_manager.set_photo_update_recommended(member_path, recommended)
@@ -1412,6 +1417,7 @@ class MainWindow(QMainWindow):
                 if latest_card:
                     latest_card.set_update_recommended(previous)
                 self._mark_reports_dirty()
+                self._schedule_gallery_refresh()
             self._show_error("Erro ao atualizar situação da foto", error)
 
         self._run_file_job(
