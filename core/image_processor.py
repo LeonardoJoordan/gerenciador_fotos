@@ -61,12 +61,18 @@ class ImageProcessor:
         ).hexdigest()
         return os.path.join(cache_dir, f"{digest}-{size}.jpg")
 
-    def load_oriented_pixmap(self, image_path: str) -> QPixmap:
+    def load_oriented_pixmap(self, image_path: str, target_size=None) -> QPixmap:
         """Carrega a imagem aplicando a orientação registrada pela câmera."""
         reader = QImageReader(image_path)
         reader.setAutoTransform(True)
         if not reader.canRead():
             return QPixmap()
+        if target_size is not None and target_size.isValid():
+            original_size = reader.size()
+            if original_size.isValid():
+                reader.setScaledSize(
+                    original_size.scaled(target_size, Qt.KeepAspectRatio)
+                )
         image = reader.read()
         return QPixmap.fromImage(image) if not image.isNull() else QPixmap()
 

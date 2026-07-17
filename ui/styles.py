@@ -92,6 +92,24 @@ QLabel#directory_status {
     padding-left: 8px;
 }
 
+QLabel#background_status {
+    color: #9ca3af;
+    font-size: 11px;
+    padding: 0 6px;
+}
+
+QProgressBar#background_progress {
+    background-color: #1e1e1e;
+    border: 1px solid #343a43;
+    border-radius: 4px;
+    height: 8px;
+}
+
+QProgressBar#background_progress::chunk {
+    background-color: #3a86ff;
+    border-radius: 3px;
+}
+
 QLabel#settings_hint {
     color: #9ca3af;
     background-color: #1b2330;
@@ -500,5 +518,45 @@ QListWidget::item {
 
 QListWidget::item:selected {
     background-color: #3a86ff;
+}
+
+QDialog#image_viewer_dialog {
+    background-color: #16181d;
+}
+
+QLabel#image_viewer_counter {
+    color: #f2f4f8;
+    font-weight: 700;
+    min-width: 58px;
+}
+
+QLabel#image_viewer_status {
+    color: #aeb6c4;
+}
+
+QToolButton#image_viewer_tool {
+    background-color: #252a33;
+    color: #f2f4f8;
+    border: 1px solid #414754;
+    border-radius: 4px;
+    font-size: 17px;
+    font-weight: 700;
+}
+
+QToolButton#image_viewer_tool:hover {
+    background-color: #343b48;
+    border-color: #5c6677;
+}
+
+QToolButton#image_viewer_tool:disabled {
+    background-color: #1d2026;
+    color: #697180;
+    border-color: #30343c;
+}
+
+QGraphicsView#image_viewer_view {
+    border: 1px solid #343943;
+    border-radius: 4px;
+    background-color: #000000;
 }
 """

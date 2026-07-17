@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 
 from ui.widgets.selection_button_grid import SelectionButtonGrid
 from ui.widgets.tag_widget import TagWidget
+from ui.widgets.clickable_image_label import ClickableImageLabel
 
 
 class MemberEditDialog(QDialog):
@@ -141,6 +142,7 @@ class PhotoCard(QFrame):
     requestAddPhotos = Signal(object, object)
     requestDelete = Signal(object)
     requestPhotoUpdate = Signal(object, bool)
+    requestPreview = Signal(object, str)
 
     def __init__(self, member_data: dict, thumb_path: str, config: dict, parent=None):
         super().__init__(parent)
@@ -159,7 +161,7 @@ class PhotoCard(QFrame):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(7)
 
-        self.img_label = QLabel(self)
+        self.img_label = ClickableImageLabel(self)
         self.img_label.setFixedSize(180, 170)
         self.img_label.setAlignment(Qt.AlignCenter)
         self.img_label.setStyleSheet("background-color: #121212; border-radius: 4px;")
@@ -172,6 +174,14 @@ class PhotoCard(QFrame):
             self.img_label.setText("Carregando miniatura…")
         else:
             self.img_label.setText("Foto pendente\n\nArraste uma imagem aqui")
+        if self.data.get("photo_count", 0) > 0:
+            self.img_label.setCursor(Qt.PointingHandCursor)
+            self.img_label.setToolTip("Abrir imagem ampliada")
+            self.img_label.clicked.connect(
+                lambda: self.requestPreview.emit(
+                    self.data, self.data["absolute_path"]
+                )
+            )
 
         self.name_label = QLabel(
             f"{self.data['posto_grad']} {self.data['nome_guerra']}", self
@@ -218,22 +228,22 @@ class PhotoCard(QFrame):
         edit_button.clicked.connect(self._edit_member)
 
         count = self.data.get("photo_count", 0)
-        update_toggle = QPushButton("", self)
-        update_toggle.setObjectName("photo_update_toggle")
-        update_toggle.setCheckable(True)
-        update_toggle.setChecked(
+        self.update_toggle = QPushButton("", self)
+        self.update_toggle.setObjectName("photo_update_toggle")
+        self.update_toggle.setCheckable(True)
+        self.update_toggle.setChecked(
             count > 0 and self.data.get("update_recommended", False)
         )
-        update_toggle.setEnabled(count > 0)
-        update_toggle.setFixedSize(28, 26)
-        update_toggle.setCursor(Qt.PointingHandCursor)
-        update_toggle.setAccessibleName("Marcar para atualizar foto")
-        update_toggle.setToolTip(
+        self.update_toggle.setEnabled(count > 0)
+        self.update_toggle.setFixedSize(28, 26)
+        self.update_toggle.setCursor(Qt.PointingHandCursor)
+        self.update_toggle.setAccessibleName("Marcar para atualizar foto")
+        self.update_toggle.setToolTip(
             "Marcar como “Atualizar”: indica que este militar deve renovar a foto."
             if count > 0
             else "Cadastros sem foto já possuem o status “Pendente”."
         )
-        update_toggle.clicked.connect(
+        self.update_toggle.clicked.connect(
             lambda checked: self.requestPhotoUpdate.emit(self.data, checked)
         )
 
@@ -252,7 +262,7 @@ class PhotoCard(QFrame):
 
         layout.addWidget(self.img_label, 0, Qt.AlignHCenter)
         layout.addWidget(self.name_label)
-        layout.addWidget(update_toggle, 0, Qt.AlignHCenter)
+        layout.addWidget(self.update_toggle, 0, Qt.AlignHCenter)
         layout.addWidget(photo_count)
         layout.addLayout(tags_layout)
         layout.addLayout(actions)
@@ -292,6 +302,12 @@ class PhotoCard(QFrame):
         self.img_label.setPixmap(
             pixmap.scaled(self.img_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         )
+
+    def set_update_recommended(self, recommended: bool):
+        self.data["update_recommended"] = recommended
+        self.update_toggle.blockSignals(True)
+        self.update_toggle.setChecked(recommended)
+        self.update_toggle.blockSignals(False)
 
     def _on_tag_changed(self, tag_type: str, new_value: str):
         squadron = self.data["esquadrao"]

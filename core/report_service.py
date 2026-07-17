@@ -27,7 +27,10 @@ class ReportService:
     @classmethod
     def _aggregate_statuses(cls, members: list[dict]) -> dict[str, Any]:
         counts = Counter(cls.member_status(member) for member in members)
-        total = len(members)
+        return cls._aggregate_counts(counts, len(members))
+
+    @classmethod
+    def _aggregate_counts(cls, counts: Counter, total: int) -> dict[str, Any]:
         current = counts[cls.STATUS_CURRENT]
         pending = counts[cls.STATUS_PENDING]
         update = counts[cls.STATUS_UPDATE]
@@ -53,44 +56,60 @@ class ReportService:
             config.get("postos_graduacoes", []),
             (member["posto_grad"] for member in members),
         )
-        totals = cls._aggregate_statuses(members)
+        total_statuses = Counter()
+        squadron_statuses = {squadron: Counter() for squadron in squadrons}
+        squadron_totals = Counter()
+        rank_statuses = {rank: Counter() for rank in ranks}
+        rank_totals = Counter()
+        squadron_rank_statuses = {
+            squadron: {rank: Counter() for rank in ranks} for squadron in squadrons
+        }
+        squadron_rank_totals = Counter()
+        counts = Counter()
+        pending = []
 
-        by_squadron = {}
-        for squadron in squadrons:
-            squad_members = [m for m in members if m["esquadrao"] == squadron]
-            by_squadron[squadron] = cls._aggregate_statuses(squad_members)
+        for member in members:
+            status = cls.member_status(member)
+            squadron = member["esquadrao"]
+            rank = member["posto_grad"]
+            total_statuses[status] += 1
+            squadron_statuses.setdefault(squadron, Counter())[status] += 1
+            squadron_totals[squadron] += 1
+            rank_statuses.setdefault(rank, Counter())[status] += 1
+            rank_totals[rank] += 1
+            squadron_rank_statuses.setdefault(squadron, {}).setdefault(
+                rank, Counter()
+            )[status] += 1
+            squadron_rank_totals[(squadron, rank)] += 1
+            counts[(rank, squadron)] += 1
+            if status == cls.STATUS_PENDING:
+                pending.append(member)
 
-        by_rank = {}
-        by_squadron_rank = {}
-        for rank in ranks:
-            rank_members = [m for m in members if m["posto_grad"] == rank]
-            by_rank[rank] = cls._aggregate_statuses(rank_members)
-
-        for squadron in squadrons:
-            by_squadron_rank[squadron] = {}
-            for rank in ranks:
-                rank_members = [
-                    member
-                    for member in members
-                    if member["esquadrao"] == squadron
-                    and member["posto_grad"] == rank
-                ]
-                by_squadron_rank[squadron][rank] = cls._aggregate_statuses(
-                    rank_members
+        totals = cls._aggregate_counts(total_statuses, len(members))
+        by_squadron = {
+            squadron: cls._aggregate_counts(
+                squadron_statuses.get(squadron, Counter()), squadron_totals[squadron]
+            )
+            for squadron in squadrons
+        }
+        by_rank = {
+            rank: cls._aggregate_counts(rank_statuses.get(rank, Counter()), rank_totals[rank])
+            for rank in ranks
+        }
+        by_squadron_rank = {
+            squadron: {
+                rank: cls._aggregate_counts(
+                    squadron_rank_statuses.get(squadron, {}).get(rank, Counter()),
+                    squadron_rank_totals[(squadron, rank)],
                 )
-
-        counts = Counter(
-            (member["posto_grad"], member["esquadrao"]) for member in members
-        )
+                for rank in ranks
+            }
+            for squadron in squadrons
+        }
         matrix = {
             rank: {squadron: counts[(rank, squadron)] for squadron in squadrons}
             for rank in ranks
         }
-        pending = [
-            member
-            for member in members
-            if cls.member_status(member) == cls.STATUS_PENDING
-        ]
         return {
             **totals,
             "esquadroes": squadrons,

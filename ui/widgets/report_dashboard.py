@@ -191,10 +191,10 @@ class ReportDashboard(QWidget):
         layout.addWidget(self.general_table)
         return page
 
-    def refresh(self, members: list[dict], config: dict):
+    def refresh(self, members: list[dict], config: dict, report: dict | None = None):
         self.members = list(members)
         self.config = config
-        self.report = ReportService.build(self.members, config)
+        self.report = report or ReportService.build(self.members, config)
         self.total_value.setText(str(self.report["total"]))
         self.current_value.setText(str(self.report["em_dia"]))
         self.pending_value.setText(str(self.report["pendente"]))
@@ -363,59 +363,63 @@ class ReportDashboard(QWidget):
             )
             and ReportService.member_status(member) in selected_statuses
         ]
-        self.general_table.setRowCount(0)
-        self.general_table.setRowCount(len(visible_members))
-        count = len(visible_members)
-        self.general_count.setText(
-            "1 militar" if count == 1 else f"{count} militares"
-        )
-        for row, member in enumerate(visible_members):
-            photo_count = member.get("photo_count", 0)
-            for column, value in enumerate(
-                [
-                    member["posto_grad"],
-                    member["nome_guerra"],
-                    member["esquadrao"],
-                    member["fracao"] or "—",
-                    photo_count,
-                ]
-            ):
-                item = QTableWidgetItem(str(value))
-                if column == 4:
-                    item.setTextAlignment(Qt.AlignCenter)
-                self.general_table.setItem(row, column, item)
-            status = ReportService.member_status(member)
-            status_label = QLabel(status, self.general_table)
-            status_label.setObjectName("report_status")
-            status_label.setProperty(
-                "photoStatus",
-                {
-                    ReportService.STATUS_CURRENT: "current",
-                    ReportService.STATUS_PENDING: "pending",
-                    ReportService.STATUS_UPDATE: "update",
-                }[status],
+        self.general_table.setUpdatesEnabled(False)
+        try:
+            self.general_table.setRowCount(0)
+            self.general_table.setRowCount(len(visible_members))
+            count = len(visible_members)
+            self.general_count.setText(
+                "1 militar" if count == 1 else f"{count} militares"
             )
-            status_label.setAlignment(Qt.AlignCenter)
-            self.general_table.setCellWidget(row, 5, status_label)
-            actions = QWidget(self.general_table)
-            action_layout = QHBoxLayout(actions)
-            action_layout.setContentsMargins(2, 2, 2, 2)
-            action_layout.setSpacing(4)
-            open_button = QPushButton("Abrir", actions)
-            add_button = QPushButton("Adicionar foto", actions)
-            delete_button = QPushButton("Excluir", actions)
-            delete_button.setObjectName("danger_btn")
-            open_button.clicked.connect(
-                lambda checked=False, item=member: self.requestOpenMember.emit(item)
-            )
-            add_button.clicked.connect(
-                lambda checked=False, item=member: self.requestAddPhoto.emit(item)
-            )
-            delete_button.clicked.connect(
-                lambda checked=False, item=member: self.requestDeleteMember.emit(item)
-            )
-            action_layout.addWidget(open_button)
-            action_layout.addWidget(add_button)
-            action_layout.addWidget(delete_button)
-            self.general_table.setCellWidget(row, 6, actions)
-        self.general_table.resizeRowsToContents()
+            for row, member in enumerate(visible_members):
+                photo_count = member.get("photo_count", 0)
+                for column, value in enumerate(
+                    [
+                        member["posto_grad"],
+                        member["nome_guerra"],
+                        member["esquadrao"],
+                        member["fracao"] or "—",
+                        photo_count,
+                    ]
+                ):
+                    item = QTableWidgetItem(str(value))
+                    if column == 4:
+                        item.setTextAlignment(Qt.AlignCenter)
+                    self.general_table.setItem(row, column, item)
+                status = ReportService.member_status(member)
+                status_label = QLabel(status, self.general_table)
+                status_label.setObjectName("report_status")
+                status_label.setProperty(
+                    "photoStatus",
+                    {
+                        ReportService.STATUS_CURRENT: "current",
+                        ReportService.STATUS_PENDING: "pending",
+                        ReportService.STATUS_UPDATE: "update",
+                    }[status],
+                )
+                status_label.setAlignment(Qt.AlignCenter)
+                self.general_table.setCellWidget(row, 5, status_label)
+                actions = QWidget(self.general_table)
+                action_layout = QHBoxLayout(actions)
+                action_layout.setContentsMargins(2, 2, 2, 2)
+                action_layout.setSpacing(4)
+                open_button = QPushButton("Abrir", actions)
+                add_button = QPushButton("Adicionar foto", actions)
+                delete_button = QPushButton("Excluir", actions)
+                delete_button.setObjectName("danger_btn")
+                open_button.clicked.connect(
+                    lambda checked=False, item=member: self.requestOpenMember.emit(item)
+                )
+                add_button.clicked.connect(
+                    lambda checked=False, item=member: self.requestAddPhoto.emit(item)
+                )
+                delete_button.clicked.connect(
+                    lambda checked=False, item=member: self.requestDeleteMember.emit(item)
+                )
+                action_layout.addWidget(open_button)
+                action_layout.addWidget(add_button)
+                action_layout.addWidget(delete_button)
+                self.general_table.setCellWidget(row, 6, actions)
+            self.general_table.resizeRowsToContents()
+        finally:
+            self.general_table.setUpdatesEnabled(True)

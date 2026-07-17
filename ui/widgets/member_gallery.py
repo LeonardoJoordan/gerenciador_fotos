@@ -1,6 +1,6 @@
 import os
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QThreadPool, Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -15,11 +15,14 @@ from PySide6.QtWidgets import (
 )
 
 from ui.widgets.flow_layout import FlowLayout
+from ui.widgets.clickable_image_label import ClickableImageLabel
+from ui.widgets.image_viewer import ImageViewerDialog
 
 
 class GalleryPhoto(QFrame):
     requestPrimary = Signal(str)
     requestRotate = Signal(str, int)
+    requestPreview = Signal(str)
     selectionChanged = Signal(str, bool)
 
     def __init__(self, photo_path: str, thumb_path: str, primary: bool, parent=None):
@@ -29,12 +32,14 @@ class GalleryPhoto(QFrame):
         self.setFixedSize(270, 320)
 
         layout = QVBoxLayout(self)
-        self.preview = QLabel(self)
+        self.preview = ClickableImageLabel(self)
         self.preview.setFixedSize(248, 185)
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setStyleSheet("background-color: #121212; border-radius: 4px;")
         self.preview.setText("Carregando miniatura…")
-        self.preview.setToolTip(photo_path)
+        self.preview.setCursor(Qt.PointingHandCursor)
+        self.preview.setToolTip("Abrir imagem ampliada")
+        self.preview.clicked.connect(lambda: self.requestPreview.emit(self.photo_path))
         layout.addWidget(self.preview, 0, Qt.AlignHCenter)
         if thumb_path:
             self.set_thumbnail(photo_path, thumb_path)
@@ -102,9 +107,17 @@ class MemberGalleryDialog(QDialog):
     requestExport = Signal(object)
     requestDelete = Signal(object, object)
 
-    def __init__(self, member: dict, thumbnail_paths: dict[str, str], parent=None):
+    def __init__(
+        self,
+        member: dict,
+        thumbnail_paths: dict[str, str],
+        parent=None,
+        image_pool: QThreadPool | None = None,
+    ):
         super().__init__(parent)
         self.member = member
+        self.thumbnail_paths = dict(thumbnail_paths)
+        self.image_pool = image_pool or QThreadPool.globalInstance()
         self.selected_paths: set[str] = set()
         self.setObjectName("member_gallery_dialog")
         self.setWindowTitle(
@@ -121,12 +134,12 @@ class MemberGalleryDialog(QDialog):
             self,
         )
         self.title.setObjectName("section_title")
-        add_button = QPushButton("Adicionar fotos", self)
-        add_button.setObjectName("primary_btn")
-        add_button.clicked.connect(self._request_add)
+        self.add_button = QPushButton("Adicionar fotos", self)
+        self.add_button.setObjectName("primary_btn")
+        self.add_button.clicked.connect(self._request_add)
         header.addWidget(self.title)
         header.addStretch()
-        header.addWidget(add_button)
+        header.addWidget(self.add_button)
         layout.addLayout(header)
 
         if member.get("is_legacy"):
@@ -174,12 +187,19 @@ class MemberGalleryDialog(QDialog):
     def _request_add(self):
         self.requestAdd.emit(self.member)
 
+    def set_busy(self, busy: bool):
+        self.add_button.setEnabled(not busy)
+        self.container.setEnabled(not busy)
+        self.export_button.setEnabled(not busy)
+        self.delete_button.setEnabled(not busy)
+
     def _request_primary(self, photo_path: str):
         self.requestPrimary.emit(self.member, photo_path)
 
     def refresh_member(self, member: dict, thumbnail_paths: dict[str, str]):
         """Atualiza a galeria aberta após uma alteração nos arquivos."""
         self.member = member
+        self.thumbnail_paths = dict(thumbnail_paths)
         self.selected_paths.clear()
         self.selection_bar.setVisible(False)
         self.title.setText(
@@ -189,6 +209,7 @@ class MemberGalleryDialog(QDialog):
         self._populate_photos(thumbnail_paths)
 
     def _populate_photos(self, thumbnail_paths: dict[str, str]):
+        self.thumbnail_paths = dict(thumbnail_paths)
         while self.flow.count():
             item = self.flow.takeAt(0)
             if item and item.widget():
@@ -204,6 +225,7 @@ class MemberGalleryDialog(QDialog):
             )
             card.requestPrimary.connect(self._request_primary)
             card.requestRotate.connect(self._request_rotate)
+            card.requestPreview.connect(self._open_preview)
             card.selectionChanged.connect(self._update_selection)
             self.flow.addWidget(card)
             self.photo_cards[photo] = card
@@ -227,6 +249,25 @@ class MemberGalleryDialog(QDialog):
 
     def _request_rotate(self, photo_path: str, degrees: int):
         self.requestRotate.emit(self.member, photo_path, degrees)
+
+    def _open_preview(self, photo_path: str):
+        normalized = os.path.abspath(photo_path)
+        index = next(
+            (
+                position
+                for position, path in enumerate(self.member["photos"])
+                if os.path.abspath(path) == normalized
+            ),
+            0,
+        )
+        viewer = ImageViewerDialog(
+            self.member["photos"],
+            index,
+            self.thumbnail_paths,
+            self.image_pool,
+            self,
+        )
+        viewer.exec()
 
     def _request_export(self):
         if self.selected_paths:

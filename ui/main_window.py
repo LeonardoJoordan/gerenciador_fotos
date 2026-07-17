@@ -1,9 +1,12 @@
 import os
 import shutil
 import weakref
+from collections.abc import Callable
+from copy import deepcopy
+from typing import Any
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QThreadPool, Qt, Signal
+from PySide6.QtCore import QSettings, QThreadPool, QTimer, Qt, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QTransform
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -20,6 +23,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -28,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.background_worker import BackgroundJob
 from core.file_manager import FileManager
 from core.image_processor import ImageProcessor
 from core.report_service import ReportService
@@ -40,6 +45,7 @@ from ui.widgets.photo_card import PhotoCard
 from ui.widgets.report_dashboard import ReportDashboard
 from ui.widgets.roster_import_dialog import RosterImportDialog
 from ui.widgets.member_gallery import MemberGalleryDialog
+from ui.widgets.image_viewer import ImageViewerDialog
 from ui.widgets.selection_button_grid import SelectionButtonGrid
 
 
@@ -103,6 +109,40 @@ class MainWindow(QMainWindow):
         self.import_rotation = 0
         self.thumbnail_pool = QThreadPool(self)
         self.thumbnail_pool.setMaxThreadCount(4)
+        self.background_pool = QThreadPool(self)
+        self.background_pool.setMaxThreadCount(2)
+        self.mutation_pool = QThreadPool(self)
+        self.mutation_pool.setMaxThreadCount(1)
+        self._job_sequence = 0
+        self._background_jobs: dict[int, dict[str, Any]] = {}
+        self._root_activation_generation = 0
+        self._reload_generation = 0
+        self._reload_running = False
+        self._reload_requested = False
+        self._reload_callbacks: list[Callable[[], None]] = []
+        self._members_by_key: dict[str, dict] = {}
+        self._cards_by_key: dict[str, PhotoCard] = {}
+        self._photo_status_versions: dict[str, int] = {}
+        self._mutations_in_flight: set[str] = set()
+        self._mutation_job_count = 0
+        self._report_snapshot: dict | None = None
+        self._report_dirty = True
+        self._gallery_dirty = True
+        self._gallery_initial_count = 72
+        self._gallery_batch_size = 24
+        self._gallery_load_more_count = 24
+        self._gallery_members: list[dict] = []
+        self._gallery_render_index = 0
+        self._gallery_target_count = 0
+        self._gallery_prefetch_blocked = True
+        self._pending_gallery_members: list[dict] = []
+        self._gallery_render_timer = QTimer(self)
+        self._gallery_render_timer.setSingleShot(True)
+        self._gallery_render_timer.timeout.connect(self._render_next_gallery_batch)
+        self._gallery_refresh_timer = QTimer(self)
+        self._gallery_refresh_timer.setSingleShot(True)
+        self._gallery_refresh_timer.setInterval(120)
+        self._gallery_refresh_timer.timeout.connect(self.populate_gallery)
         self._thumbnail_jobs = {}
         self._thumbnail_targets = {}
         self.init_ui()
@@ -121,8 +161,19 @@ class MainWindow(QMainWindow):
         self.lbl_dir_status = QLabel("Nenhuma pasta selecionada", self)
         self.lbl_dir_status.setObjectName("directory_status")
         self.lbl_dir_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.background_status = QLabel("Pronto", self)
+        self.background_status.setObjectName("background_status")
+        self.background_status.setVisible(False)
+        self.background_progress = QProgressBar(self)
+        self.background_progress.setObjectName("background_progress")
+        self.background_progress.setRange(0, 0)
+        self.background_progress.setFixedWidth(170)
+        self.background_progress.setTextVisible(False)
+        self.background_progress.setVisible(False)
         root_bar.addWidget(self.btn_select_dir)
         root_bar.addWidget(self.lbl_dir_status, 1)
+        root_bar.addWidget(self.background_status)
+        root_bar.addWidget(self.background_progress)
         root_layout.addLayout(root_bar)
 
         self.tabs = QTabWidget(self)
@@ -130,8 +181,302 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_gallery_tab(), "Galeria e Filtros")
         self.tabs.addTab(self._build_reports_tab(), "Relatórios")
         self.tabs.addTab(self._build_settings_tab(), "Configurações")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.setEnabled(False)
         root_layout.addWidget(self.tabs, 1)
+
+    def _start_background_job(
+        self,
+        description: str,
+        callback: Callable[[], Any],
+        on_finished: Callable[[Any], None] | None = None,
+        on_failed: Callable[[Exception], None] | None = None,
+        pool: QThreadPool | None = None,
+    ) -> int:
+        self._job_sequence += 1
+        job_id = self._job_sequence
+        worker = BackgroundJob(job_id, callback)
+        self._background_jobs[job_id] = {
+            "description": description,
+            "on_finished": on_finished,
+            "on_failed": on_failed,
+            "worker": worker,
+        }
+        worker.signals.finished.connect(self._background_job_finished)
+        worker.signals.failed.connect(self._background_job_failed)
+        (pool or self.background_pool).start(worker)
+        self._update_background_indicator()
+        return job_id
+
+    def _background_job_finished(self, job_id: int, result: object):
+        record = self._background_jobs.pop(job_id, None)
+        self._update_background_indicator()
+        if not record:
+            return
+        on_finished = record.get("on_finished")
+        if on_finished:
+            try:
+                on_finished(result)
+            except Exception as exc:
+                self._show_error("Erro ao atualizar a interface", exc)
+
+    def _background_job_failed(self, job_id: int, payload: object):
+        record = self._background_jobs.pop(job_id, None)
+        self._update_background_indicator()
+        error = self._job_exception(payload)
+        if not record:
+            self._show_error("Erro em tarefa em segundo plano", error)
+            return
+        on_failed = record.get("on_failed")
+        if on_failed:
+            try:
+                on_failed(error)
+            except Exception as callback_error:
+                self._show_error("Erro ao tratar falha de tarefa", callback_error)
+        else:
+            self._show_error(str(record.get("description") or "Erro"), error)
+
+    @staticmethod
+    def _job_exception(payload: object) -> Exception:
+        if isinstance(payload, dict) and isinstance(payload.get("exception"), Exception):
+            return payload["exception"]
+        if isinstance(payload, Exception):
+            return payload
+        return RuntimeError(str(payload))
+
+    def _update_background_indicator(self):
+        if not hasattr(self, "background_status"):
+            return
+        total = len(self._background_jobs) + len(self._thumbnail_jobs)
+        visible = total > 0
+        self.background_status.setVisible(visible)
+        self.background_progress.setVisible(visible)
+        if visible:
+            label = "1 tarefa em segundo plano" if total == 1 else f"{total} tarefas em segundo plano"
+            self.background_status.setText(label)
+        else:
+            self.background_status.setText("Pronto")
+
+    @staticmethod
+    def _file_manager_for_job(root_directory: str, config: dict) -> FileManager:
+        file_manager = FileManager(root_directory)
+        file_manager.config = deepcopy(config)
+        return file_manager
+
+    @staticmethod
+    def _load_root_snapshot(directory: str) -> dict:
+        file_manager = FileManager()
+        config = file_manager.set_root_path(directory)
+        members = file_manager.scan_directory()
+        report = ReportService.build(members, config)
+        return {
+            "directory": os.path.abspath(directory),
+            "config": config,
+            "members": members,
+            "report": report,
+        }
+
+    @staticmethod
+    def _scan_snapshot(root_directory: str, config: dict) -> dict:
+        file_manager = MainWindow._file_manager_for_job(root_directory, config)
+        members = file_manager.scan_directory()
+        return {
+            "directory": os.path.abspath(root_directory),
+            "members": members,
+            "report": ReportService.build(members, file_manager.config),
+        }
+
+    def _apply_loaded_data(self, members: list[dict], report: dict | None = None):
+        self.members_data = list(members)
+        self._rebuild_member_index()
+        self.refresh_filter_options()
+        self._gallery_dirty = True
+        if self.tabs.currentIndex() == 1:
+            self.populate_gallery()
+        else:
+            self._gallery_render_timer.stop()
+            self._clear_gallery()
+        self._mark_reports_dirty(report)
+
+    def _run_file_job(
+        self,
+        description: str,
+        operation: Callable[[FileManager, ImageProcessor, str], Any],
+        on_finished: Callable[[Any], None] | None = None,
+        on_failed: Callable[[Exception], None] | None = None,
+        error_title: str | None = None,
+        resource_path: str | None = None,
+        busy_target: QWidget | None = None,
+    ):
+        if not self.root_directory:
+            return
+        root_directory = self.root_directory
+        config = deepcopy(self.config)
+        resource_key = self._member_key(resource_path) if resource_path else ""
+        if resource_key and resource_key in self._mutations_in_flight:
+            return
+        if resource_key:
+            self._mutations_in_flight.add(resource_key)
+        self._mutation_job_count += 1
+        self.btn_select_dir.setEnabled(False)
+        self._set_busy_target(busy_target, True)
+
+        def callback():
+            file_manager = self._file_manager_for_job(root_directory, config)
+            image_processor = ImageProcessor()
+            return operation(file_manager, image_processor, root_directory)
+
+        def release():
+            if resource_key:
+                self._mutations_in_flight.discard(resource_key)
+            self._mutation_job_count = max(0, self._mutation_job_count - 1)
+            if self._mutation_job_count == 0 and self.tabs.isEnabled():
+                self.btn_select_dir.setEnabled(True)
+            self._set_busy_target(busy_target, False)
+
+        def finish(result: object):
+            release()
+            if os.path.abspath(root_directory) != os.path.abspath(self.root_directory):
+                return
+            if on_finished:
+                on_finished(result)
+
+        def fail(error: Exception):
+            release()
+            if os.path.abspath(root_directory) != os.path.abspath(self.root_directory):
+                return
+            if on_failed:
+                on_failed(error)
+            else:
+                self._show_error(error_title or description, error)
+
+        self._start_background_job(
+            description,
+            callback,
+            finish,
+            fail,
+            pool=self.mutation_pool,
+        )
+
+    @staticmethod
+    def _set_busy_target(target: QWidget | None, busy: bool):
+        if target is None:
+            return
+        try:
+            setter = getattr(target, "set_busy", None)
+            if callable(setter):
+                setter(busy)
+            else:
+                target.setEnabled(not busy)
+        except RuntimeError:
+            pass
+
+    def _member_photos_for_path(self, member_path: str) -> list[str]:
+        member = self._members_by_key.get(self._member_key(member_path))
+        return list(member.get("photos", [])) if member else []
+
+    @staticmethod
+    def _invalidate_photos(root_directory: str, image_processor: ImageProcessor, photos: list[str]):
+        for photo in photos:
+            image_processor.invalidate_thumbnail(root_directory, photo)
+
+    @staticmethod
+    def _member_key(member_path: str) -> str:
+        return os.path.normcase(os.path.realpath(os.path.abspath(member_path)))
+
+    def _member_sort_key(self, member: dict) -> tuple:
+        rank_order = {
+            rank.casefold(): index
+            for index, rank in enumerate(self.config.get("postos_graduacoes", []))
+        }
+        rank = member["posto_grad"].casefold()
+        return (
+            rank_order.get(rank, len(rank_order)),
+            rank,
+            member["nome_guerra"].casefold(),
+            member["esquadrao"].casefold(),
+            member["fracao"].casefold(),
+        )
+
+    def _rebuild_member_index(self):
+        self._members_by_key = {
+            self._member_key(member["member_path"]): member
+            for member in self.members_data
+        }
+
+    def _upsert_member(self, member: dict, previous_path: str | None = None):
+        old_key = self._member_key(previous_path or member["member_path"])
+        new_key = self._member_key(member["member_path"])
+        previous = self._members_by_key.get(old_key) or self._members_by_key.get(new_key)
+        classification_changed = previous is None or any(
+            previous.get(field) != member.get(field)
+            for field in ("posto_grad", "esquadrao", "fracao")
+        )
+        self.members_data = [
+            item
+            for item in self.members_data
+            if self._member_key(item["member_path"]) not in {old_key, new_key}
+        ]
+        self.members_data.append(member)
+        self.members_data.sort(key=self._member_sort_key)
+        self._rebuild_member_index()
+        if classification_changed:
+            self.refresh_filter_options()
+        self._mark_reports_dirty()
+        self._sync_gallery_after_member_change({old_key, new_key})
+
+    def _apply_member_result(self, result: object, previous_path: str | None = None):
+        if isinstance(result, dict) and result.get("member_path"):
+            self._upsert_member(result, previous_path)
+        else:
+            self.reload_data()
+
+    def _remove_member(self, member_path: str):
+        key = self._member_key(member_path)
+        self.members_data = [
+            member
+            for member in self.members_data
+            if self._member_key(member["member_path"]) != key
+        ]
+        self._rebuild_member_index()
+        self.refresh_filter_options()
+        self._mark_reports_dirty()
+        self._sync_gallery_after_member_change({key})
+
+    def _mark_reports_dirty(self, report: dict | None = None):
+        self._report_snapshot = report
+        self._report_dirty = True
+        if hasattr(self, "tabs") and self.tabs.currentIndex() == 2:
+            self._refresh_reports_if_needed()
+
+    def _refresh_reports_if_needed(self):
+        if not self._report_dirty or not hasattr(self, "report_dashboard"):
+            return
+        report = self._report_snapshot or ReportService.build(
+            self.members_data, self.config
+        )
+        self._report_snapshot = report
+        self.report_dashboard.refresh(self.members_data, self.config, report)
+        self._report_dirty = False
+
+    def _on_tab_changed(self, index: int):
+        if index == 1:
+            if self._gallery_dirty:
+                self.populate_gallery()
+            elif self._gallery_render_index < self._gallery_target_count:
+                self._gallery_render_timer.start(0)
+            else:
+                QTimer.singleShot(0, self._maybe_load_more_gallery_cards)
+        elif index == 2:
+            self._refresh_reports_if_needed()
+
+    def _sync_gallery_after_member_change(self, changed_keys: set[str]):
+        if not hasattr(self, "flow_layout"):
+            return
+        if self.tabs.currentIndex() != 1 and self._gallery_render_index == 0:
+            self._gallery_dirty = True
+            return
+        self._reconcile_loaded_gallery(changed_keys)
 
     # ------------------------------------------------------------------ Importação
     def _build_import_tab(self) -> QWidget:
@@ -294,28 +639,45 @@ class MainWindow(QMainWindow):
             )
             for member in self.members_data
         }
-        created = 0
-        skipped = 0
-        for row in dialog.valid_rows():
-            values = {
-                key: row[key]
-                for key in ("posto_grad", "nome_guerra", "esquadrao", "fracao")
-            }
-            key = tuple(values[field].casefold() for field in values)
-            if key in existing:
-                skipped += 1
-                continue
-            try:
-                self.file_manager.create_member(**values)
-                existing.add(key)
-                created += 1
-            except FileExistsError:
-                skipped += 1
-        self.reload_data()
-        QMessageBox.information(
-            self,
-            "Relação importada",
-            f"{created} cadastro(s) criado(s).\n{skipped} duplicado(s) ignorado(s).",
+        rows = dialog.valid_rows()
+
+        def operation(file_manager: FileManager, image_processor: ImageProcessor, root_directory: str):
+            created = 0
+            skipped = 0
+            seen = set(existing)
+            for row in rows:
+                values = {
+                    key: row[key]
+                    for key in ("posto_grad", "nome_guerra", "esquadrao", "fracao")
+                }
+                key = tuple(values[field].casefold() for field in values)
+                if key in seen:
+                    skipped += 1
+                    continue
+                try:
+                    file_manager.create_member(**values)
+                    seen.add(key)
+                    created += 1
+                except FileExistsError:
+                    skipped += 1
+            return {"created": created, "skipped": skipped}
+
+        def finish(result: object):
+            created = result.get("created", 0) if isinstance(result, dict) else 0
+            skipped = result.get("skipped", 0) if isinstance(result, dict) else 0
+            self.reload_data(
+                on_finished=lambda: QMessageBox.information(
+                    self,
+                    "Relação importada",
+                    f"{created} cadastro(s) criado(s).\n{skipped} duplicado(s) ignorado(s).",
+                )
+            )
+
+        self._run_file_job(
+            "Importando relação",
+            operation,
+            finish,
+            error_title="Erro ao importar relação",
         )
 
     def select_import_file(self):
@@ -326,15 +688,14 @@ class MainWindow(QMainWindow):
             self.set_import_source(path)
 
     def set_import_source(self, path: str):
-        pixmap = self.image_processor.load_oriented_pixmap(path)
-        if pixmap.isNull():
-            QMessageBox.warning(self, "Imagem inválida", "O arquivo não pôde ser lido como imagem.")
-            return
         self.import_source_path = path
         self.import_rotation = 0
+        if not self._update_import_preview():
+            self.import_source_path = ""
+            QMessageBox.warning(self, "Imagem inválida", "O arquivo não pôde ser lido como imagem.")
+            return
         self.btn_rotate_import_counterclockwise.setEnabled(True)
         self.btn_rotate_import_clockwise.setEnabled(True)
-        self._update_import_preview()
 
     def rotate_import_preview(self, degrees: int = 90):
         if not self.import_source_path:
@@ -343,7 +704,11 @@ class MainWindow(QMainWindow):
         self._update_import_preview()
 
     def _update_import_preview(self):
-        pixmap = self.image_processor.load_oriented_pixmap(self.import_source_path)
+        pixmap = self.image_processor.load_oriented_pixmap(
+            self.import_source_path, self.import_preview.size()
+        )
+        if pixmap.isNull():
+            return False
         if self.import_rotation:
             pixmap = pixmap.transformed(
                 QTransform().rotate(self.import_rotation), Qt.SmoothTransformation
@@ -352,6 +717,7 @@ class MainWindow(QMainWindow):
             pixmap.scaled(self.import_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         )
         self.import_preview.setToolTip(self.import_source_path)
+        return True
 
     def update_import_sections(self, squadron: str):
         sections = self.config.get("esquadroes", {}).get(squadron, [])
@@ -393,45 +759,64 @@ class MainWindow(QMainWindow):
             )
             if answer != QMessageBox.Yes:
                 return
-        destination = ""
-        try:
-            if not self.import_source_path:
-                self.file_manager.create_member(**values)
-            elif existing:
-                member_path = existing["member_path"]
-                if existing.get("is_legacy"):
-                    self.image_processor.invalidate_thumbnail(
-                        self.root_directory, existing["absolute_path"]
+        source_path = self.import_source_path
+        rotation = self.import_rotation
+        existing_member = deepcopy(existing) if existing else None
+        self.btn_save_import.setEnabled(False)
+
+        def operation(file_manager: FileManager, image_processor: ImageProcessor, root_directory: str):
+            destination = ""
+            try:
+                if not source_path:
+                    file_manager.create_member(**values)
+                elif existing_member:
+                    member_path = existing_member["member_path"]
+                    if existing_member.get("is_legacy"):
+                        image_processor.invalidate_thumbnail(
+                            root_directory, existing_member["absolute_path"]
+                        )
+                        member_path = file_manager.convert_legacy_member(member_path)
+                    destination = file_manager.add_photos(member_path, [source_path])[0]
+                else:
+                    destination = file_manager.import_and_format_photo(
+                        source_path, **values
                     )
-                    member_path = self.file_manager.convert_legacy_member(member_path)
-                destination = self.file_manager.add_photos(
-                    member_path, [self.import_source_path]
-                )[0]
-            else:
-                destination = self.file_manager.import_and_format_photo(
-                    self.import_source_path, **values
+                if destination and rotation:
+                    image_processor.rotate_image_file(destination, rotation)
+                return {"destination": destination}
+            except Exception:
+                if destination and os.path.isfile(destination):
+                    image_processor.invalidate_thumbnail(root_directory, destination)
+                    os.remove(destination)
+                    member_dir = os.path.dirname(destination)
+                    if os.path.isdir(member_dir) and not os.listdir(member_dir):
+                        os.rmdir(member_dir)
+                raise
+
+        def finish(result: object):
+            self.btn_save_import.setEnabled(True)
+            destination = result.get("destination", "") if isinstance(result, dict) else ""
+            self.clear_import_form()
+            self.reload_data(
+                on_finished=lambda: QMessageBox.information(
+                    self,
+                    "Cadastro salvo",
+                    "A foto foi importada e organizada com sucesso."
+                    if destination
+                    else "O cadastro sem foto foi criado com sucesso.",
                 )
-            if destination and self.import_rotation:
-                self.image_processor.rotate_image_file(destination, self.import_rotation)
-        except Exception as exc:
-            if destination and os.path.isfile(destination):
-                self.image_processor.invalidate_thumbnail(
-                    self.root_directory, destination
-                )
-                os.remove(destination)
-                member_dir = os.path.dirname(destination)
-                if os.path.isdir(member_dir) and not os.listdir(member_dir):
-                    os.rmdir(member_dir)
-            self._show_error("Erro na importação", exc)
-            return
-        self.clear_import_form()
-        self.reload_data()
-        QMessageBox.information(
-            self,
-            "Cadastro salvo",
-            "A foto foi importada e organizada com sucesso."
-            if destination
-            else "O cadastro sem foto foi criado com sucesso.",
+            )
+
+        def fail(error: Exception):
+            self.btn_save_import.setEnabled(True)
+            self._show_error("Erro na importação", error)
+
+        self._run_file_job(
+            "Salvando cadastro",
+            operation,
+            finish,
+            fail,
+            "Erro na importação",
         )
 
     def clear_import_form(self):
@@ -520,7 +905,7 @@ class MainWindow(QMainWindow):
         filters.addWidget(self.filter_unrecognized_button)
         filters.addStretch()
 
-        self.search_input.textChanged.connect(self.populate_gallery)
+        self.search_input.textChanged.connect(self._schedule_gallery_refresh)
         self.filter_photo_buttons.selectionChanged.connect(
             self._on_photo_filters_changed
         )
@@ -545,6 +930,12 @@ class MainWindow(QMainWindow):
         self.flow_layout = FlowLayout(self.grid_container, margin=5, h_spacing=15, v_spacing=15)
         self.grid_container.setLayout(self.flow_layout)
         self.scroll_area.setWidget(self.grid_container)
+        self.scroll_area.verticalScrollBar().valueChanged.connect(
+            self._on_gallery_scroll
+        )
+        self.scroll_area.verticalScrollBar().rangeChanged.connect(
+            lambda minimum, maximum: self._schedule_gallery_prefetch()
+        )
         content_layout.addWidget(self.scroll_area)
 
         filter_scroll = QScrollArea(self)
@@ -613,24 +1004,24 @@ class MainWindow(QMainWindow):
             self.filter_squadron_buttons.select_all(emit=False)
             self._refresh_fraction_filters(force_all=True)
         self._update_filter_toggle_labels()
-        self.populate_gallery()
+        self._schedule_gallery_refresh()
 
     def _on_photo_filters_changed(self):
         self.filter_unrecognized_button.setChecked(False)
         self._update_filter_toggle_labels()
-        self.populate_gallery()
+        self._schedule_gallery_refresh()
 
     def _on_squadron_filters_changed(self):
         self.filter_unrecognized_button.setChecked(False)
         fractions_were_all = self.filter_section_buttons.all_selected()
         self._refresh_fraction_filters(force_all=fractions_were_all)
         self._update_filter_toggle_labels()
-        self.populate_gallery()
+        self._schedule_gallery_refresh()
 
     def _on_section_filters_changed(self):
         self.filter_unrecognized_button.setChecked(False)
         self._update_filter_toggle_labels()
-        self.populate_gallery()
+        self._schedule_gallery_refresh()
 
     def _on_unrecognized_filter_toggled(self, checked: bool):
         if checked:
@@ -640,7 +1031,7 @@ class MainWindow(QMainWindow):
             self.filter_section_buttons.clear_selection(emit=False)
             self._refresh_fraction_filters()
             self._update_filter_toggle_labels()
-        self.populate_gallery()
+        self._schedule_gallery_refresh()
 
     def _toggle_all_ranks(self):
         if self.filter_rank_buttons.all_selected():
@@ -702,22 +1093,58 @@ class MainWindow(QMainWindow):
         self._set_filter_toggle_label(self.btn_all_squadrons, self.filter_squadron_buttons)
         self._set_filter_toggle_label(self.btn_all_sections, self.filter_section_buttons)
 
+    def _schedule_gallery_refresh(self):
+        if hasattr(self, "_gallery_refresh_timer"):
+            self._gallery_refresh_timer.start()
+
     def populate_gallery(self):
         if not hasattr(self, "flow_layout"):
             return
+        if self.tabs.currentIndex() != 1:
+            self._gallery_dirty = True
+            return
+        self._gallery_refresh_timer.stop()
+        self._gallery_render_timer.stop()
+        self._clear_gallery()
+        self._gallery_members = self._filtered_gallery_members()
+        self._gallery_render_index = 0
+        self._gallery_target_count = min(
+            self._gallery_initial_count, len(self._gallery_members)
+        )
+        self._gallery_prefetch_blocked = True
+        self._pending_gallery_members = self._gallery_members[
+            : self._gallery_target_count
+        ]
+        self._gallery_dirty = False
+        self.lbl_section.setText(f"Militares ({len(self._gallery_members)})")
+        self._render_next_gallery_batch()
+
+    def _clear_gallery(self):
         while self.flow_layout.count():
             item = self.flow_layout.takeAt(0)
             if item and item.widget():
                 item.widget().deleteLater()
+        self._cards_by_key.clear()
+        self._gallery_members = []
+        self._gallery_render_index = 0
+        self._gallery_target_count = 0
+        self._pending_gallery_members = []
 
+    def _filtered_gallery_members(self) -> list[dict]:
         term = self.search_input.text().strip().casefold()
         ranks = set(self.filter_rank_buttons.selected_values())
         squadrons = set(self.filter_squadron_buttons.selected_values())
         sections = set(self.filter_section_buttons.selected_values())
         photo_statuses = set(self.filter_photo_buttons.selected_values())
         configured_structure = self.config.get("esquadroes", {})
+        configured_section_sets = {
+            squadron: set(values) for squadron, values in configured_structure.items()
+        }
+        selected_sections_by_squadron: dict[str, set[str]] = {}
+        for squadron, section in sections:
+            selected_sections_by_squadron.setdefault(squadron, set()).add(section)
         show_unrecognized = self.filter_unrecognized_button.isChecked()
-        shown = 0
+        visible_members = []
         for member in self.members_data:
             searchable = f"{member['posto_grad']} {member['nome_guerra']}".casefold()
             if term and term not in searchable:
@@ -733,41 +1160,163 @@ class MainWindow(QMainWindow):
                     continue
                 if not squadrons or member["esquadrao"] not in squadrons:
                     continue
-                configured_sections = configured_structure.get(member["esquadrao"], [])
+                configured_sections = configured_section_sets.get(member["esquadrao"], set())
                 if member["fracao"] in configured_sections:
                     if (member["esquadrao"], member["fracao"]) not in sections:
                         continue
-                elif configured_sections and not set(configured_sections).issubset(
-                    {
-                        section
-                        for squadron, section in sections
-                        if squadron == member["esquadrao"]
-                    }
+                elif configured_sections and not configured_sections.issubset(
+                    selected_sections_by_squadron.get(member["esquadrao"], set())
                 ):
                     # Fração legada: aparece ao mostrar todas as frações do esquadrão,
                     # mas não contamina a lista de filtros nem o config.json.
                     continue
 
-            thumb_path = self.image_processor.get_cached_thumbnail(
-                self.root_directory, member["absolute_path"]
-            )
-            card = PhotoCard(
-                member,
-                thumb_path,
-                self.config,
-                self,
-            )
-            card.requestMove.connect(self.handle_member_move)
-            card.requestEdit.connect(self.handle_member_edit)
-            card.requestGallery.connect(self.open_member_gallery)
-            card.requestAddPhotos.connect(self.handle_card_add_photos)
-            card.requestDelete.connect(self.handle_member_delete)
-            card.requestPhotoUpdate.connect(self.handle_photo_update_recommended)
-            self.flow_layout.addWidget(card)
-            if member["absolute_path"] and not thumb_path:
-                self._queue_thumbnail(member["absolute_path"], 150, card)
-            shown += 1
-        self.lbl_section.setText(f"Militares ({shown})")
+            visible_members.append(member)
+        return visible_members
+
+    def _render_next_gallery_batch(self):
+        if self.tabs.currentIndex() != 1:
+            return
+        end = min(
+            self._gallery_render_index + self._gallery_batch_size,
+            self._gallery_target_count,
+            len(self._gallery_members),
+        )
+        if end <= self._gallery_render_index:
+            self._pending_gallery_members = []
+            return
+        batch = self._gallery_members[self._gallery_render_index:end]
+        self.grid_container.setUpdatesEnabled(False)
+        try:
+            for member in batch:
+                self._add_gallery_card(member)
+        finally:
+            self.grid_container.setUpdatesEnabled(True)
+        self._gallery_render_index = end
+        self._pending_gallery_members = self._gallery_members[
+            self._gallery_render_index : self._gallery_target_count
+        ]
+        if self._gallery_render_index < self._gallery_target_count:
+            self._gallery_render_timer.start(0)
+        else:
+            QTimer.singleShot(0, self._maybe_load_more_gallery_cards)
+
+    def _add_gallery_card(self, member: dict):
+        card = self._create_gallery_card(member)
+        self.flow_layout.addWidget(card)
+        self._cards_by_key[self._member_key(member["member_path"])] = card
+
+    def _create_gallery_card(self, member: dict) -> PhotoCard:
+        thumb_path = self.image_processor.get_cached_thumbnail(
+            self.root_directory, member["absolute_path"]
+        )
+        card = PhotoCard(
+            member,
+            thumb_path,
+            self.config,
+            self,
+        )
+        card.requestMove.connect(self.handle_member_move)
+        card.requestEdit.connect(self.handle_member_edit)
+        card.requestGallery.connect(self.open_member_gallery)
+        card.requestAddPhotos.connect(self.handle_card_add_photos)
+        card.requestDelete.connect(self.handle_member_delete)
+        card.requestPhotoUpdate.connect(self.handle_photo_update_recommended)
+        card.requestPreview.connect(self.open_member_image_viewer)
+        if member["absolute_path"] and not thumb_path:
+            self._queue_thumbnail(member["absolute_path"], 150, card)
+        return card
+
+    def _schedule_gallery_prefetch(self):
+        if self.tabs.currentIndex() == 1:
+            QTimer.singleShot(0, self._maybe_load_more_gallery_cards)
+
+    def _on_gallery_scroll(self):
+        self._gallery_prefetch_blocked = False
+        self._schedule_gallery_prefetch()
+
+    def _maybe_load_more_gallery_cards(self):
+        if (
+            self.tabs.currentIndex() != 1
+            or self._gallery_dirty
+            or self._gallery_prefetch_blocked
+            or self._gallery_render_timer.isActive()
+            or self._gallery_render_index < self._gallery_target_count
+            or self._gallery_render_index >= len(self._gallery_members)
+        ):
+            return
+        scroll_bar = self.scroll_area.verticalScrollBar()
+        remaining = scroll_bar.maximum() - scroll_bar.value()
+        threshold = max(1, self.scroll_area.viewport().height() * 2)
+        if scroll_bar.maximum() > 0 and remaining > threshold:
+            return
+        self._gallery_target_count = min(
+            len(self._gallery_members),
+            self._gallery_target_count + self._gallery_load_more_count,
+        )
+        self._gallery_prefetch_blocked = True
+        self._gallery_render_timer.start(0)
+
+    def _reconcile_loaded_gallery(self, changed_keys: set[str]):
+        self._gallery_render_timer.stop()
+        filtered = self._filtered_gallery_members()
+        loaded_count = min(self._gallery_render_index, len(filtered))
+        desired_members = filtered[:loaded_count]
+        scroll_bar = self.scroll_area.verticalScrollBar()
+        scroll_value = scroll_bar.value()
+
+        existing_items = {}
+        while self.flow_layout.count():
+            item = self.flow_layout.takeAt(0)
+            widget = item.widget() if item else None
+            if isinstance(widget, PhotoCard):
+                existing_items[self._member_key(widget.data["member_path"])] = item
+            elif widget:
+                widget.deleteLater()
+
+        cards: dict[str, PhotoCard] = {}
+        self.grid_container.setUpdatesEnabled(False)
+        try:
+            for member in desired_members:
+                key = self._member_key(member["member_path"])
+                item = existing_items.pop(key, None)
+                if item is not None and key not in changed_keys:
+                    self.flow_layout.addItem(item)
+                    cards[key] = item.widget()
+                    continue
+                if item is not None and item.widget():
+                    item.widget().deleteLater()
+                card = self._create_gallery_card(member)
+                self.flow_layout.addWidget(card)
+                cards[key] = card
+            for item in existing_items.values():
+                if item.widget():
+                    item.widget().deleteLater()
+        finally:
+            self.grid_container.setUpdatesEnabled(True)
+
+        self._cards_by_key = cards
+        self._gallery_members = filtered
+        self._gallery_render_index = loaded_count
+        self._gallery_target_count = min(
+            max(
+                loaded_count,
+                self._gallery_target_count,
+                min(self._gallery_initial_count, len(filtered)),
+            ),
+            len(filtered),
+        )
+        self._pending_gallery_members = self._gallery_members[
+            self._gallery_render_index : self._gallery_target_count
+        ]
+        self._gallery_dirty = False
+        self.lbl_section.setText(f"Militares ({len(filtered)})")
+        scroll_bar.setValue(scroll_value)
+        QTimer.singleShot(0, lambda value=scroll_value: scroll_bar.setValue(value))
+        if self._gallery_render_index < self._gallery_target_count:
+            self._gallery_render_timer.start(0)
+        else:
+            QTimer.singleShot(0, self._maybe_load_more_gallery_cards)
 
     def _member_is_unrecognized(self, member: dict) -> bool:
         ranks = self.config.get("postos_graduacoes", [])
@@ -778,13 +1327,22 @@ class MainWindow(QMainWindow):
         return bool(member["fracao"] and member["fracao"] not in structure[squadron])
 
     def handle_member_move(self, current_path: str, squadron: str, section: str):
-        try:
-            self._invalidate_member_thumbnails(current_path)
-            self.file_manager.move_member(current_path, squadron, section)
-            self.reload_data()
-        except Exception as exc:
-            self._show_error("Erro ao mover arquivo", exc)
-            self.reload_data()
+        photos = self._member_photos_for_path(current_path)
+        source = self.sender()
+
+        def operation(file_manager: FileManager, image_processor: ImageProcessor, root_directory: str):
+            MainWindow._invalidate_photos(root_directory, image_processor, photos)
+            destination = file_manager.move_member(current_path, squadron, section)
+            return file_manager.read_member(destination)
+
+        self._run_file_job(
+            "Movendo cadastro",
+            operation,
+            lambda result: self._apply_member_result(result, current_path),
+            error_title="Erro ao mover arquivo",
+            resource_path=current_path,
+            busy_target=source if isinstance(source, PhotoCard) else None,
+        )
 
     def handle_member_edit(
         self,
@@ -794,25 +1352,74 @@ class MainWindow(QMainWindow):
         squadron: str,
         section: str,
     ):
-        try:
-            self._invalidate_member_thumbnails(current_path)
-            self.file_manager.update_member(
+        photos = self._member_photos_for_path(current_path)
+        source = self.sender()
+
+        def operation(file_manager: FileManager, image_processor: ImageProcessor, root_directory: str):
+            MainWindow._invalidate_photos(root_directory, image_processor, photos)
+            destination = file_manager.update_member(
                 current_path, rank, name, squadron, section
             )
-            self.reload_data()
-        except Exception as exc:
-            self._show_error("Erro ao editar cadastro", exc)
-            self.reload_data()
+            return file_manager.read_member(destination)
+
+        self._run_file_job(
+            "Editando cadastro",
+            operation,
+            lambda result: self._apply_member_result(result, current_path),
+            error_title="Erro ao editar cadastro",
+            resource_path=current_path,
+            busy_target=source if isinstance(source, PhotoCard) else None,
+        )
 
     def handle_photo_update_recommended(self, member: dict, recommended: bool):
-        try:
-            self.file_manager.set_photo_update_recommended(
-                member["member_path"], recommended
-            )
-            self.reload_data()
-        except Exception as exc:
-            self._show_error("Erro ao atualizar situação da foto", exc)
-            self.reload_data()
+        member_path = member["member_path"]
+        key = self._member_key(member_path)
+        current = self._members_by_key.get(key, member)
+        previous = bool(current.get("update_recommended", False))
+        if key in self._mutations_in_flight:
+            card = self._cards_by_key.get(key)
+            if card:
+                card.set_update_recommended(previous)
+            return
+        version = self._photo_status_versions.get(key, 0) + 1
+        self._photo_status_versions[key] = version
+        current["update_recommended"] = recommended
+        card = self._cards_by_key.get(key)
+        if card:
+            card.set_update_recommended(recommended)
+        self._mark_reports_dirty()
+
+        def operation(file_manager: FileManager, image_processor: ImageProcessor, root_directory: str):
+            file_manager.set_photo_update_recommended(member_path, recommended)
+            return recommended
+
+        def finish(result: object):
+            if self._photo_status_versions.get(key) != version:
+                return
+            latest = self._members_by_key.get(key)
+            if latest:
+                latest["update_recommended"] = recommended
+            latest_card = self._cards_by_key.get(key)
+            if latest_card:
+                latest_card.set_update_recommended(recommended)
+
+        def fail(error: Exception):
+            if self._photo_status_versions.get(key) == version:
+                latest = self._members_by_key.get(key)
+                if latest:
+                    latest["update_recommended"] = previous
+                latest_card = self._cards_by_key.get(key)
+                if latest_card:
+                    latest_card.set_update_recommended(previous)
+                self._mark_reports_dirty()
+            self._show_error("Erro ao atualizar situação da foto", error)
+
+        self._run_file_job(
+            "Atualizando situação da foto",
+            operation,
+            finish,
+            on_failed=fail,
+        )
 
     def open_member_gallery(self, member: dict):
         thumbnail_paths = {
@@ -821,7 +1428,12 @@ class MainWindow(QMainWindow):
             )
             for photo in member["photos"]
         }
-        dialog = MemberGalleryDialog(member, thumbnail_paths, self)
+        dialog = MemberGalleryDialog(
+            member,
+            thumbnail_paths,
+            self,
+            image_pool=self.background_pool,
+        )
         self._queue_gallery_thumbnails(dialog)
         dialog.requestAdd.connect(self.handle_gallery_add)
         dialog.requestPrimary.connect(self.handle_set_primary)
@@ -829,6 +1441,42 @@ class MainWindow(QMainWindow):
         dialog.requestExport.connect(self.handle_export_photos)
         dialog.requestDelete.connect(self.handle_delete_photos)
         dialog.exec()
+
+    def open_member_image_viewer(self, member: dict, photo_path: str):
+        current = self._members_by_key.get(
+            self._member_key(member["member_path"]), member
+        )
+        photos = list(current.get("photos", []))
+        if not photos:
+            return
+        normalized = os.path.abspath(photo_path)
+        initial_index = next(
+            (
+                index
+                for index, path in enumerate(photos)
+                if os.path.abspath(path) == normalized
+            ),
+            0,
+        )
+        thumbnail_paths = {
+            path: (
+                self.image_processor.get_cached_thumbnail(
+                    self.root_directory, path, 210
+                )
+                or self.image_processor.get_cached_thumbnail(
+                    self.root_directory, path, 150
+                )
+            )
+            for path in photos
+        }
+        viewer = ImageViewerDialog(
+            photos,
+            initial_index,
+            thumbnail_paths,
+            self.background_pool,
+            self,
+        )
+        viewer.exec()
 
     def handle_card_add_photos(self, member: dict, paths: list[str]):
         valid_paths = [
@@ -840,18 +1488,29 @@ class MainWindow(QMainWindow):
         if not valid_paths:
             QMessageBox.warning(self, "Imagem inválida", "Nenhuma imagem suportada foi solta.")
             return
-        try:
-            member_path = member["member_path"]
-            if member.get("is_legacy"):
-                self.image_processor.invalidate_thumbnail(
-                    self.root_directory, member["absolute_path"]
+        member_snapshot = deepcopy(member)
+        source = self.sender()
+
+        def operation(file_manager: FileManager, image_processor: ImageProcessor, root_directory: str):
+            member_path = member_snapshot["member_path"]
+            if member_snapshot.get("is_legacy"):
+                image_processor.invalidate_thumbnail(
+                    root_directory, member_snapshot["absolute_path"]
                 )
-                member_path = self.file_manager.convert_legacy_member(member_path)
-            self.file_manager.add_photos(member_path, valid_paths)
-            self.reload_data()
-        except Exception as exc:
-            self._show_error("Erro ao adicionar fotos", exc)
-            self.reload_data()
+                member_path = file_manager.convert_legacy_member(member_path)
+            file_manager.add_photos(member_path, valid_paths)
+            return file_manager.read_member(member_path)
+
+        self._run_file_job(
+            "Adicionando fotos",
+            operation,
+            lambda result: self._apply_member_result(
+                result, member_snapshot["member_path"]
+            ),
+            error_title="Erro ao adicionar fotos",
+            resource_path=member_snapshot["member_path"],
+            busy_target=source if isinstance(source, PhotoCard) else None,
+        )
 
     def _build_reports_tab(self) -> QWidget:
         self.report_dashboard = ReportDashboard(self)
@@ -894,21 +1553,30 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.Yes:
             return
-        try:
-            for photo in member.get("photos", []):
-                self.image_processor.invalidate_thumbnail(
-                    self.root_directory, photo
-                )
-            self.file_manager.delete_member(member["member_path"])
-            self.reload_data()
-            QMessageBox.information(
-                self,
-                "Cadastro excluído",
-                f"O cadastro de {identity} foi excluído.",
-            )
-        except Exception as exc:
-            self._show_error("Erro ao excluir cadastro", exc)
-            self.reload_data()
+        member_path = member["member_path"]
+        photos = list(member.get("photos", []))
+        source = self.sender()
+
+        def operation(file_manager: FileManager, image_processor: ImageProcessor, root_directory: str):
+            MainWindow._invalidate_photos(root_directory, image_processor, photos)
+            file_manager.delete_member(member_path)
+            return member_path
+
+        self._run_file_job(
+            "Excluindo cadastro",
+            operation,
+            lambda result: (
+                self._remove_member(member_path),
+                QMessageBox.information(
+                    self,
+                    "Cadastro excluído",
+                    f"O cadastro de {identity} foi excluído.",
+                ),
+            ),
+            error_title="Erro ao excluir cadastro",
+            resource_path=member_path,
+            busy_target=source if isinstance(source, PhotoCard) else None,
+        )
 
     def export_reports(self, context: dict):
         suggested_filename = ReportService.export_filename(context)
@@ -920,17 +1588,19 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        try:
-            written = ReportService.export_view(
-                path, self.members_data, self.config, context
-            )
-            QMessageBox.information(
+        members = deepcopy(self.members_data)
+        config = deepcopy(self.config)
+        export_context = deepcopy(context)
+        self._start_background_job(
+            "Exportando relatório",
+            lambda: ReportService.export_view(path, members, config, export_context),
+            lambda written: QMessageBox.information(
                 self,
                 "Relatório exportado",
                 f"A visualização atual foi salva em:\n{written}",
-            )
-        except Exception as exc:
-            self._show_error("Erro ao exportar relatório", exc)
+            ),
+            lambda error: self._show_error("Erro ao exportar relatório", error),
+        )
 
     def handle_gallery_add(self, member: dict):
         dialog = self.sender()
@@ -939,61 +1609,113 @@ class MainWindow(QMainWindow):
         )
         if not paths:
             return
-        member_path = member["member_path"]
-        try:
-            if member.get("is_legacy"):
-                answer = QMessageBox.question(
-                    self,
-                    "Converter cadastro antigo",
-                    "Para adicionar novas fotos, o cadastro antigo será movido para "
-                    "uma pasta individual. Deseja continuar?",
+        member_snapshot = deepcopy(member)
+        if member_snapshot.get("is_legacy"):
+            answer = QMessageBox.question(
+                self,
+                "Converter cadastro antigo",
+                "Para adicionar novas fotos, o cadastro antigo será movido para "
+                "uma pasta individual. Deseja continuar?",
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        def operation(file_manager: FileManager, image_processor: ImageProcessor, root_directory: str):
+            member_path = member_snapshot["member_path"]
+            if member_snapshot.get("is_legacy"):
+                image_processor.invalidate_thumbnail(
+                    root_directory, member_snapshot["absolute_path"]
                 )
-                if answer != QMessageBox.Yes:
-                    return
-                self.image_processor.invalidate_thumbnail(
-                    self.root_directory, member["absolute_path"]
-                )
-                member_path = self.file_manager.convert_legacy_member(member_path)
+                member_path = file_manager.convert_legacy_member(member_path)
             elif not os.path.isdir(member_path):
                 # Permite adicionar novamente após excluir todas as fotos sem
                 # precisar fechar e reabrir a galeria.
                 os.makedirs(member_path, exist_ok=True)
-            destinations = self.file_manager.add_photos(member_path, paths)
-            self.reload_data()
-            self._refresh_gallery_dialog(dialog, member_path)
+            destinations = file_manager.add_photos(member_path, paths)
+            return {
+                "member": file_manager.read_member(member_path),
+                "count": len(destinations),
+            }
+
+        def finish(result: object):
+            count = result.get("count", 0) if isinstance(result, dict) else 0
+            updated = result.get("member") if isinstance(result, dict) else None
+            if not isinstance(updated, dict):
+                self.reload_data()
+                return
+            self._upsert_member(updated, member_snapshot["member_path"])
+            self._refresh_gallery_dialog(dialog, updated["member_path"])
             QMessageBox.information(
                 self,
                 "Fotos adicionadas",
-                f"{len(destinations)} foto(s) adicionada(s) à galeria.",
+                f"{count} foto(s) adicionada(s) à galeria.",
             )
-        except Exception as exc:
-            self._show_error("Erro ao adicionar fotos", exc)
+
+        def fail(error: Exception):
+            self._show_error("Erro ao adicionar fotos", error)
             self.reload_data()
+
+        self._run_file_job(
+            "Adicionando fotos",
+            operation,
+            finish,
+            on_failed=fail,
+            resource_path=member_snapshot["member_path"],
+            busy_target=dialog if isinstance(dialog, MemberGalleryDialog) else None,
+        )
 
     def handle_set_primary(self, member: dict, photo_path: str):
         dialog = self.sender()
-        try:
-            for photo in member["photos"]:
-                self.image_processor.invalidate_thumbnail(self.root_directory, photo)
-            self.file_manager.set_primary_photo(member["member_path"], photo_path)
+        member_path = member["member_path"]
+        photos = list(member["photos"])
+
+        def operation(file_manager: FileManager, image_processor: ImageProcessor, root_directory: str):
+            MainWindow._invalidate_photos(root_directory, image_processor, photos)
+            file_manager.set_primary_photo(member_path, photo_path)
+            return file_manager.read_member(member_path)
+
+        def fail(error: Exception):
+            self._show_error("Erro ao definir foto principal", error)
             self.reload_data()
-            self._refresh_gallery_dialog(dialog, member["member_path"])
-        except Exception as exc:
-            self._show_error("Erro ao definir foto principal", exc)
-            self.reload_data()
+
+        self._run_file_job(
+            "Definindo foto principal",
+            operation,
+            lambda result: (
+                self._apply_member_result(result, member_path),
+                self._refresh_gallery_dialog(dialog, member_path),
+            ),
+            on_failed=fail,
+            resource_path=member_path,
+            busy_target=dialog if isinstance(dialog, MemberGalleryDialog) else None,
+        )
 
     def handle_rotate_gallery_photo(
         self, member: dict, photo_path: str, degrees: int
     ):
         dialog = self.sender()
-        try:
-            self.image_processor.invalidate_thumbnail(self.root_directory, photo_path)
-            self.image_processor.rotate_image_file(photo_path, degrees)
+        member_path = member["member_path"]
+
+        def operation(file_manager: FileManager, image_processor: ImageProcessor, root_directory: str):
+            image_processor.invalidate_thumbnail(root_directory, photo_path)
+            image_processor.rotate_image_file(photo_path, degrees)
+            return file_manager.read_member(member_path)
+
+        def fail(error: Exception):
+            self._show_error("Erro ao girar imagem", error)
             self.reload_data()
-            self._refresh_gallery_dialog(dialog, member["member_path"])
-        except Exception as exc:
-            self._show_error("Erro ao girar imagem", exc)
-            self.reload_data()
+
+        self._run_file_job(
+            "Girando imagem",
+            operation,
+            lambda result: (
+                self._apply_member_result(result, member_path),
+                self._refresh_gallery_dialog(dialog, member_path),
+            ),
+            on_failed=fail,
+            resource_path=member_path,
+            busy_target=dialog if isinstance(dialog, MemberGalleryDialog) else None,
+        )
 
     def handle_export_photos(self, photo_paths: list[str]):
         if not photo_paths:
@@ -1013,8 +1735,7 @@ class MainWindow(QMainWindow):
                     destination += Path(photo_path).suffix
                 if os.path.abspath(destination) == os.path.abspath(photo_path):
                     raise ValueError("Escolha um destino diferente do arquivo original.")
-                shutil.copy2(photo_path, destination)
-                exported = 1
+                copy_pairs = [(photo_path, destination)]
             else:
                 directory = QFileDialog.getExistingDirectory(
                     self, "Selecionar pasta para exportar as cópias"
@@ -1040,18 +1761,28 @@ class MainWindow(QMainWindow):
                     )
                     if answer != QMessageBox.Yes:
                         return
-                for source, destination in zip(photo_paths, destinations):
-                    shutil.copy2(source, destination)
-                exported = len(photo_paths)
-            QMessageBox.information(
+                copy_pairs = list(zip(photo_paths, destinations))
+        except Exception as exc:
+            self._show_error("Erro ao exportar imagens", exc)
+            return
+
+        def copy_photos():
+            for source, destination in copy_pairs:
+                shutil.copy2(source, destination)
+            return len(copy_pairs)
+
+        self._start_background_job(
+            "Exportando imagens",
+            copy_photos,
+            lambda exported: QMessageBox.information(
                 self,
                 "Cópia exportada" if exported == 1 else "Cópias exportadas",
                 "A imagem foi copiada para o destino escolhido."
                 if exported == 1
                 else f"{exported} imagens foram copiadas para o destino escolhido.",
-            )
-        except Exception as exc:
-            self._show_error("Erro ao exportar imagens", exc)
+            ),
+            lambda error: self._show_error("Erro ao exportar imagens", error),
+        )
 
     def handle_delete_photos(self, member: dict, photo_paths: list[str]):
         dialog = self.sender()
@@ -1079,13 +1810,26 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.Yes:
             return
-        try:
-            for photo in member["photos"]:
-                self.image_processor.invalidate_thumbnail(self.root_directory, photo)
-            self.file_manager.delete_photos(member["member_path"], photo_paths)
-            self.reload_data()
+        member_snapshot = deepcopy(member)
+
+        def operation(file_manager: FileManager, image_processor: ImageProcessor, root_directory: str):
+            MainWindow._invalidate_photos(
+                root_directory, image_processor, list(member_snapshot["photos"])
+            )
+            file_manager.delete_photos(member_snapshot["member_path"], photo_paths)
+            return file_manager.read_member(member_snapshot["member_path"])
+
+        def finish(result: object):
+            if isinstance(result, dict):
+                self._upsert_member(result, member_snapshot["member_path"])
+                updated_path = result["member_path"]
+            else:
+                self._remove_member(member_snapshot["member_path"])
+                updated_path = member_snapshot["member_path"]
             self._refresh_gallery_dialog(
-                dialog, member["member_path"], empty_member=member
+                dialog,
+                updated_path,
+                empty_member=member_snapshot,
             )
             QMessageBox.information(
                 self,
@@ -1094,9 +1838,19 @@ class MainWindow(QMainWindow):
                 if count == 1
                 else f"{count} imagens foram excluídas.",
             )
-        except Exception as exc:
-            self._show_error("Erro ao excluir imagens", exc)
+
+        def fail(error: Exception):
+            self._show_error("Erro ao excluir imagens", error)
             self.reload_data()
+
+        self._run_file_job(
+            "Excluindo imagens",
+            operation,
+            finish,
+            on_failed=fail,
+            resource_path=member_snapshot["member_path"],
+            busy_target=dialog if isinstance(dialog, MemberGalleryDialog) else None,
+        )
 
     def _refresh_gallery_dialog(
         self,
@@ -1174,6 +1928,7 @@ class MainWindow(QMainWindow):
         self._thumbnail_jobs[key] = worker
         worker.signals.finished.connect(self._thumbnail_finished)
         self.thumbnail_pool.start(worker)
+        self._update_background_indicator()
 
     def _thumbnail_finished(self, key, photo_path: str, thumbnail_path: str):
         self._thumbnail_jobs.pop(key, None)
@@ -1187,6 +1942,7 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 # O card pode ter sido destruído por uma troca rápida de filtro.
                 pass
+        self._update_background_indicator()
 
     # --------------------------------------------------------------- Configurações
     def _build_settings_tab(self) -> QWidget:
@@ -1465,8 +2221,10 @@ class MainWindow(QMainWindow):
             return
         self.refresh_config_dependent_ui()
         self.refresh_filter_options()
-        self.populate_gallery()
-        self.report_dashboard.refresh(self.members_data, self.config)
+        self._gallery_dirty = True
+        if self.tabs.currentIndex() == 1:
+            self.populate_gallery()
+        self._mark_reports_dirty()
         QMessageBox.information(self, "Estrutura salva", "O config.json foi atualizado.")
 
     def _store_visible_sections(self):
@@ -1487,24 +2245,53 @@ class MainWindow(QMainWindow):
 
     def activate_root_directory(self, directory: str, show_errors: bool = True) -> bool:
         """Ativa uma raiz manualmente ou restaurada das preferências da aplicação."""
-        try:
-            config = self.file_manager.set_root_path(directory)
-        except Exception as exc:
+        directory = os.path.abspath(directory)
+        self._root_activation_generation += 1
+        self._reload_generation += 1
+        self._reload_running = False
+        self._reload_requested = False
+        self._reload_callbacks.clear()
+        generation = self._root_activation_generation
+        self.root_directory = directory
+        self.lbl_dir_status.setText(f"{directory} (carregando...)")
+        self.tabs.setEnabled(False)
+        self.btn_select_dir.setEnabled(False)
+
+        def apply_snapshot(result: object):
+            if generation != self._root_activation_generation or not isinstance(result, dict):
+                return
+            loaded_directory = result["directory"]
+            config = result["config"]
+            self.file_manager = FileManager(loaded_directory)
+            self.file_manager.config = deepcopy(config)
+            self.root_directory = loaded_directory
+            self.config = config
+            self.lbl_dir_status.setText(loaded_directory)
+            self.tabs.setEnabled(True)
+            self.btn_select_dir.setEnabled(self._mutation_job_count == 0)
+            self.populate_settings()
+            self.refresh_config_dependent_ui()
+            self._apply_loaded_data(result["members"], result["report"])
+            settings = QSettings()
+            settings.setValue("last_root_directory", loaded_directory)
+            settings.sync()
+
+        def handle_error(error: Exception):
+            if generation != self._root_activation_generation:
+                return
+            self.btn_select_dir.setEnabled(True)
+            self.tabs.setEnabled(False)
             if show_errors:
-                self._show_error("Pasta raiz inválida", exc)
+                self._show_error("Pasta raiz inválida", error)
             else:
                 self.lbl_dir_status.setText("A última pasta não pôde ser reaberta.")
-            return False
-        self.root_directory = directory
-        self.config = config
-        self.lbl_dir_status.setText(directory)
-        self.tabs.setEnabled(True)
-        self.populate_settings()
-        self.refresh_config_dependent_ui()
-        self.reload_data()
-        settings = QSettings()
-        settings.setValue("last_root_directory", directory)
-        settings.sync()
+
+        self._start_background_job(
+            "Abrindo pasta raiz",
+            lambda: self._load_root_snapshot(directory),
+            apply_snapshot,
+            handle_error,
+        )
         return True
 
     def restore_last_root_directory(self):
@@ -1525,13 +2312,66 @@ class MainWindow(QMainWindow):
             settings.sync()
             self.lbl_dir_status.setText("A última pasta não existe mais. Selecione outra pasta.")
 
-    def reload_data(self):
+    def reload_data(self, on_finished: Callable[[], None] | None = None):
         if not self.root_directory:
             return
-        self.members_data = self.file_manager.scan_directory()
-        self.refresh_filter_options()
-        self.populate_gallery()
-        self.report_dashboard.refresh(self.members_data, self.config)
+        if on_finished:
+            self._reload_callbacks.append(on_finished)
+        if self._reload_running:
+            self._reload_requested = True
+            return
+        self._start_reload()
+
+    def _start_reload(self):
+        if not self.root_directory:
+            self._reload_callbacks.clear()
+            return
+        self._reload_generation += 1
+        generation = self._reload_generation
+        root_directory = self.root_directory
+        config = deepcopy(self.config)
+        self._reload_running = True
+        self._reload_requested = False
+
+        def apply_snapshot(result: object):
+            if generation != self._reload_generation:
+                return
+            self._reload_running = False
+            if (
+                not isinstance(result, dict)
+                or os.path.abspath(result["directory"])
+                != os.path.abspath(self.root_directory)
+            ):
+                self._reload_callbacks.clear()
+                return
+            if self._reload_requested:
+                self._start_reload()
+                return
+            self._apply_loaded_data(result["members"], result["report"])
+            callbacks = self._reload_callbacks
+            self._reload_callbacks = []
+            for callback in callbacks:
+                try:
+                    callback()
+                except Exception as exc:
+                    self._show_error("Erro ao concluir atualização", exc)
+
+        def fail(error: Exception):
+            if generation != self._reload_generation:
+                return
+            self._reload_running = False
+            if self._reload_requested:
+                self._start_reload()
+                return
+            self._reload_callbacks.clear()
+            self._show_error("Erro ao atualizar dados", error)
+
+        self._start_background_job(
+            "Atualizando dados",
+            lambda: self._scan_snapshot(root_directory, config),
+            apply_snapshot,
+            fail,
+        )
 
     def refresh_config_dependent_ui(self):
         self.import_rank_buttons.set_options(

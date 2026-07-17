@@ -30,6 +30,11 @@ class FlowLayout(QLayout):
             return self._item_list.pop(index)
         return None
 
+    def insertItem(self, index: int, item: QLayoutItem):
+        index = max(0, min(index, len(self._item_list)))
+        self._item_list.insert(index, item)
+        self.invalidate()
+
     def expandingDirections(self) -> Qt.Orientations:
         return Qt.Orientations(0)
 
@@ -64,21 +69,21 @@ class FlowLayout(QLayout):
         line_height = 0
 
         for item in self._item_list:
-            widget = item.widget()
+            item_size = item.sizeHint()
             space_x = self._h_spacing
             space_y = self._v_spacing
             
-            next_x = x + item.sizeHint().width() + space_x
+            next_x = x + item_size.width() + space_x
             if next_x - space_x > effective_rect.right() and line_height > 0:
                 x = effective_rect.x()
                 y = y + line_height + space_y
-                next_x = x + item.sizeHint().width() + space_x
+                next_x = x + item_size.width() + space_x
                 line_height = 0
 
             if not test_only:
-                item.setGeometry(QRect(QPoint(x, y), item.sizeHint()))
+                item.setGeometry(QRect(QPoint(x, y), item_size))
 
             x = next_x
-            line_height = max(line_height, item.sizeHint().height())
+            line_height = max(line_height, item_size.height())
 
         return y + line_height - rect.y() + margins.bottom()

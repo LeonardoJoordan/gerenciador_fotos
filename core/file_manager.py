@@ -376,16 +376,7 @@ class FileManager:
                     items.append(item)
 
         for member in grouped_members.values():
-            member["photos"].sort(key=self._photo_sort_key)
-            member["photo_count"] = len(member["photos"])
-            member["has_photo"] = bool(member["photos"])
-            if member["photos"]:
-                member["absolute_path"] = self._primary_photo(member["photos"])
-                member["filename"] = os.path.basename(member["absolute_path"])
-            else:
-                member["absolute_path"] = ""
-                member["filename"] = ""
-            items.append(member)
+            items.append(self._finalize_modern_member(member))
         rank_order = {
             rank.casefold(): index
             for index, rank in enumerate(self.config.get("postos_graduacoes", []))
@@ -401,6 +392,63 @@ class FileManager:
                 item["fracao"].casefold(),
             ),
         )
+
+    def read_member(self, member_path: str) -> Dict[str, Any] | None:
+        """Lê somente um cadastro depois de uma alteração localizada no disco."""
+        self._require_root()
+        member_path = os.path.abspath(member_path)
+        root = os.path.abspath(self.root_path)
+        if os.path.commonpath([root, member_path]) != root:
+            raise ValueError("O cadastro informado não pertence à pasta raiz.")
+
+        if os.path.isdir(member_path):
+            directory = Path(member_path)
+            if not self._directory_is_member(directory):
+                return None
+            member = self._parse_member_directory(member_path)
+            if not member:
+                return None
+            for child in directory.iterdir():
+                if (
+                    child.is_file()
+                    and child.suffix.lower() in self.VALID_EXTENSIONS
+                    and self._parse_member_photo(str(child))
+                ):
+                    member["photos"].append(os.path.abspath(child))
+            return self._finalize_modern_member(member)
+
+        if os.path.isfile(member_path):
+            if Path(member_path).suffix.lower() not in self.VALID_EXTENSIONS:
+                return None
+            item = self._parse_file_info(member_path)
+            if not item:
+                return None
+            item.update(
+                {
+                    "member_path": item["absolute_path"],
+                    "photos": [item["absolute_path"]],
+                    "photo_count": 1,
+                    "has_photo": True,
+                    "is_legacy": True,
+                    "update_recommended": os.path.isfile(
+                        self._photo_update_marker_path(item["absolute_path"])
+                    ),
+                }
+            )
+            return item
+        return None
+
+    def _finalize_modern_member(self, member: Dict[str, Any]) -> Dict[str, Any]:
+        member["photos"].sort(key=self._photo_sort_key)
+        member["photo_count"] = len(member["photos"])
+        member["has_photo"] = bool(member["photos"])
+        if member["photos"]:
+            member["absolute_path"] = self._primary_photo(member["photos"])
+            member["filename"] = os.path.basename(member["absolute_path"])
+        else:
+            member["absolute_path"] = ""
+            member["filename"] = ""
+        return member
 
     def _parse_member_photo(self, file_path: str) -> Dict[str, Any] | None:
         """Reconhece o formato Unidade/Fração/Pessoa/Pessoa_01.ext."""
